@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from datetime import datetime
+import time
 
 from database import get_db
 import models, schemas
@@ -8,12 +9,16 @@ from ws_manager import manager
 
 router = APIRouter(prefix="/api/rfid", tags=["rfid"])
 
+# In-memory cooldown-register: { epc: last_seen_unix_timestamp }
+_last_seen: dict[str, float] = {}
+
 
 @router.post("/read")
 async def rfid_tag_read(read: schemas.RfidRead, db: Session = Depends(get_db)):
     """
     Mottar en RFID-avlesning fra Impinj-leseren (eller simulatoren).
     Finner deltakeren med matchende tag og registrerer en runde automatisk.
+    Cooldown-perioden hentes fra løpets innstillinger (rfid_cooldown_seconds).
     """
     epc = read.epc.strip().upper()
     timestamp = read.timestamp or datetime.utcnow()
@@ -36,7 +41,18 @@ async def rfid_tag_read(read: schemas.RfidRead, db: Session = Depends(get_db)):
     if participant.status != models.ParticipantStatus.ACTIVE:
         return {"status": "ignored", "reason": f"Deltaker har status {participant.status.value}"}
 
-    # Unngå dobbel-registrering for samme runde
+    # Cooldown-sjekk: unngå dobbel-registrering
+    cooldown = race.rfid_cooldown_seconds
+    now_ts = time.time()
+    last_ts = _last_seen.get(epc, 0)
+    if (now_ts - last_ts) < cooldown:
+        remaining = int(cooldown - (now_ts - last_ts))
+        return {
+            "status": "cooldown",
+            "reason": f"Tag {epc[-6:]} lest for {int(now_ts - last_ts)}s siden – cooldown {cooldown}s ({remaining}s igjen)"
+        }
+
+    # Unngå dobbel-registrering for samme runde i databasen
     existing_lap = (
         db.query(models.Lap)
         .filter(
@@ -46,7 +62,11 @@ async def rfid_tag_read(read: schemas.RfidRead, db: Session = Depends(get_db)):
         .first()
     )
     if existing_lap:
+        _last_seen[epc] = now_ts
         return {"status": "ignored", "reason": "Runde allerede registrert"}
+
+    # Oppdater cooldown-register
+    _last_seen[epc] = now_ts
 
     # Beregn rundetid
     duration = None
@@ -83,4 +103,17 @@ async def rfid_tag_read(read: schemas.RfidRead, db: Session = Depends(get_db)):
         "participant": participant.name,
         "lap_number": race.current_lap,
         "laps_completed": participant.laps_completed
+    }
+
+
+@router.get("/cooldown-status")
+def get_cooldown_status():
+    """Se hvilke tags som er i cooldown (for debugging)."""
+    now_ts = time.time()
+    return {
+        epc: {
+            "last_seen_seconds_ago": int(now_ts - ts),
+            "last_seen_at": datetime.utcfromtimestamp(ts).isoformat()
+        }
+        for epc, ts in _last_seen.items()
     }

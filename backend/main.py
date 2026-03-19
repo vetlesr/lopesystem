@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -5,17 +6,26 @@ import uvicorn
 from database import engine, Base
 from routers import races, participants, rfid
 from ws_manager import manager
+from scheduler import start_scheduler, stop_scheduler
 
 # Opprett alle tabeller ved oppstart
 Base.metadata.create_all(bind=engine)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    start_scheduler()
+    yield
+    stop_scheduler()
+
+
 app = FastAPI(
     title="Løpesystem API",
     description="Skreddersydd tidtakingssystem for ultraløp",
-    version="0.1.0"
+    version="0.2.0",
+    lifespan=lifespan
 )
 
-# CORS – tillat frontend å snakke med backend lokalt
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://localhost:3000"],
@@ -24,7 +34,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Registrer routers
 app.include_router(races.router)
 app.include_router(participants.router)
 app.include_router(rfid.router)
@@ -32,16 +41,14 @@ app.include_router(rfid.router)
 
 @app.get("/")
 def root():
-    return {"message": "Løpesystem API er oppe og kjører 🏃"}
+    return {"message": "Løpesystem API er oppe og kjører 🏃", "version": "0.2.0"}
 
 
 @app.websocket("/ws/races/{race_id}")
 async def websocket_endpoint(websocket: WebSocket, race_id: int):
-    """WebSocket-endepunkt for live-oppdateringer per løp."""
     await manager.connect(race_id, websocket)
     try:
         while True:
-            # Hold tilkoblingen åpen; vi sender data via broadcast
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(race_id, websocket)

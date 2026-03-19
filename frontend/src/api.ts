@@ -19,6 +19,7 @@ export interface Race {
   location: string | null
   lap_distance_km: number
   lap_time_minutes: number
+  rfid_cooldown_seconds: number
   is_active: boolean
   is_finished: boolean
   current_lap: number
@@ -51,6 +52,7 @@ export interface Participant {
 export const getRaces = () => api.get<Race[]>('/races/').then(r => r.data)
 export const getRace = (id: number) => api.get<Race>(`/races/${id}`).then(r => r.data)
 export const createRace = (data: Partial<Race>) => api.post<Race>('/races/', data).then(r => r.data)
+export const updateRace = (id: number, data: Partial<Race>) => api.patch<Race>(`/races/${id}`, data).then(r => r.data)
 export const deleteRace = (id: number) => api.delete(`/races/${id}`)
 export const startRace = (id: number) => api.post<Race>(`/races/${id}/start`).then(r => r.data)
 export const nextLap = (id: number) => api.post<Race>(`/races/${id}/next-lap`).then(r => r.data)
@@ -70,5 +72,25 @@ export const updateParticipant = (raceId: number, participantId: number, data: P
 export const removeParticipant = (raceId: number, participantId: number) =>
   api.delete(`/races/${raceId}/participants/${participantId}`)
 
-export const registerLap = (raceId: number, participantId: number) =>
-  api.post<Participant>(`/races/${raceId}/participants/${participantId}/lap`).then(r => r.data)
+export const registerLap = (raceId: number, participantId: number, finishTime?: string) =>
+  api.post<Participant>(`/races/${raceId}/participants/${participantId}/lap`, {
+    finish_time: finishTime || null
+  }).then(r => r.data)
+
+export const editLap = (raceId: number, participantId: number, lapId: number, finishTime: string) =>
+  api.patch<Lap>(`/races/${raceId}/participants/${participantId}/laps/${lapId}`, {
+    finish_time: finishTime
+  }).then(r => r.data)
+
+export const deleteLap = (raceId: number, participantId: number, lapId: number) =>
+  api.delete(`/races/${raceId}/participants/${participantId}/laps/${lapId}`)
+
+export const finishParticipant = (raceId: number, participantId: number, lastLap?: number) =>
+  api.post<Participant>(`/races/${raceId}/participants/${participantId}/finish`, {
+    last_lap: lastLap ?? null
+  }).then(r => r.data)
+
+export const getLastLap = (raceId: number, participantId: number) =>
+  api.get<{ participant_id: number; laps_completed: number; last_lap_number: number; last_finish_time: string | null }>(
+    `/races/${raceId}/participants/${participantId}/last-lap`
+  ).then(r => r.data)

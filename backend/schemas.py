@@ -13,12 +13,14 @@ class RaceCreate(BaseModel):
     location: Optional[str] = None
     lap_distance_km: float = 6.706
     lap_time_minutes: int = 60
+    rfid_cooldown_seconds: int = 30  # Cooldown mellom avlesninger av samme tag
 
 
 class RaceUpdate(BaseModel):
     name: Optional[str] = None
     date: Optional[datetime] = None
     location: Optional[str] = None
+    rfid_cooldown_seconds: Optional[int] = None
 
 
 class RaceOut(BaseModel):
@@ -29,6 +31,7 @@ class RaceOut(BaseModel):
     location: Optional[str]
     lap_distance_km: float
     lap_time_minutes: int
+    rfid_cooldown_seconds: int
     is_active: bool
     is_finished: bool
     current_lap: int
@@ -86,6 +89,23 @@ class LapCreate(BaseModel):
     recorded_by: str = "manual"
 
 
+class LapRegisterManual(BaseModel):
+    """Manuell runderegistrering med valgfritt tidspunkt."""
+    finish_time: Optional[datetime] = None  # Hvis None, brukes nåværende tid
+
+
+class LapUpdate(BaseModel):
+    """Oppdater tidspunkt for en eksisterende runde."""
+    finish_time: datetime
+
+
 class RfidRead(BaseModel):
     epc: str
     timestamp: Optional[datetime] = None
+
+
+# ─── Finish (fullfør løper) ───────────────────────────────────────────────────
+
+class FinishParticipantRequest(BaseModel):
+    """Marker en løper som ferdig (RTC). Returnerer forslag på siste fullførte runde."""
+    last_lap: Optional[int] = None  # Hvis None, brukes siste registrerte runde

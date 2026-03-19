@@ -28,14 +28,15 @@ class Race(Base):
     location = Column(String, nullable=True)
 
     # Backyard Ultra-spesifikke felt
-    lap_distance_km = Column(Float, default=6.706)   # Standard BYU-distanse
-    lap_time_minutes = Column(Integer, default=60)    # Minutter per runde
+    lap_distance_km = Column(Float, default=6.706)        # Standard BYU-distanse
+    lap_time_minutes = Column(Integer, default=60)         # Minutter per runde
+    rfid_cooldown_seconds = Column(Integer, default=30)    # Cooldown mellom avlesninger av samme tag
 
     # Status
-    is_active = Column(Boolean, default=False)        # Løpet er i gang
-    is_finished = Column(Boolean, default=False)      # Løpet er avsluttet
-    current_lap = Column(Integer, default=0)          # Gjeldende rundenummer
-    lap_start_time = Column(DateTime, nullable=True)  # Når nåværende runde startet
+    is_active = Column(Boolean, default=False)
+    is_finished = Column(Boolean, default=False)
+    current_lap = Column(Integer, default=0)
+    lap_start_time = Column(DateTime, nullable=True)
 
     created_at = Column(DateTime, server_default=func.now())
 
@@ -50,7 +51,7 @@ class Participant(Base):
 
     name = Column(String, nullable=False)
     bib_number = Column(Integer, nullable=False)
-    rfid_tag = Column(String, nullable=True)          # EPC fra RFID-tag
+    rfid_tag = Column(String, nullable=True)
 
     status = Column(Enum(ParticipantStatus), default=ParticipantStatus.DNS)
     laps_completed = Column(Integer, default=0)
@@ -59,7 +60,8 @@ class Participant(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     race = relationship("Race", back_populates="participants")
-    laps = relationship("Lap", back_populates="participant", cascade="all, delete-orphan")
+    laps = relationship("Lap", back_populates="participant", cascade="all, delete-orphan",
+                        order_by="Lap.lap_number")
 
 
 class Lap(Base):
@@ -69,8 +71,8 @@ class Lap(Base):
     participant_id = Column(Integer, ForeignKey("participants.id"), nullable=False)
 
     lap_number = Column(Integer, nullable=False)
-    finish_time = Column(DateTime, nullable=False)    # Tidspunkt for målpassering
-    lap_duration_seconds = Column(Float, nullable=True)  # Tid brukt på runden
+    finish_time = Column(DateTime, nullable=False)
+    lap_duration_seconds = Column(Float, nullable=True)
     recorded_by = Column(String, default="manual")   # "manual" eller "rfid"
 
     participant = relationship("Participant", back_populates="laps")
