@@ -412,6 +412,7 @@ export default function BackyardDashboard() {
           </div>
           <div className="flex items-center gap-2">
             <a href={exportCsv(raceId)} download className="text-slate-400 hover:text-white text-sm px-3 py-1.5 bg-slate-700 rounded-lg">⬇ CSV</a>
+            <Link to={`/race/${raceId}/participants`} className="text-slate-400 hover:text-white text-sm px-3 py-1.5 bg-slate-700 rounded-lg">👥 Deltakere</Link>
             <Link to={`/race/${raceId}/scoreboard`} className="text-slate-400 hover:text-white text-sm px-3 py-1.5 bg-slate-700 rounded-lg">📺 TV</Link>
           </div>
         </div>

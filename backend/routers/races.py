@@ -76,21 +76,25 @@ async def start_race(race_id: int, db: Session = Depends(get_db)):
     if race.is_active:
         raise HTTPException(status_code=400, detail="Løpet er allerede i gang")
 
+    now = datetime.utcnow()
     race.is_active = True
     race.is_finished = False
     race.current_loop = 1
-    race.loop_start_utc = datetime.utcnow()
+    race.loop_start_utc = now
 
+    # Sett alle DNS til active_running ved start
     for p in race.participants:
         if p.status == models.RunnerStatus.DNS:
             p.status = models.RunnerStatus.ACTIVE_RUNNING
 
-    _log(db, race_id, "loop_start", {"loop": 1, "time": race.loop_start_utc.isoformat()})
+    _log(db, race_id, "loop_start", {"loop": 1, "time": now.isoformat()})
     db.commit()
     db.refresh(race)
 
+    # Planlegg neste runde med nøyaktig starttidspunkt
     if race.auto_start_next_loop:
-        schedule_next_loop(race_id, race.loop_duration_minutes)
+        schedule_next_loop(race_id, race.loop_duration_minutes, now)
+        print(f"[Race] Auto-start aktivert for løp {race_id}, {race.loop_duration_minutes} min per runde")
 
     await manager.broadcast(race_id, {
         "event": "race_started",
@@ -114,7 +118,7 @@ async def next_loop(race_id: int, db: Session = Depends(get_db)):
     await _advance_loop(race, db)
 
     if race.auto_start_next_loop:
-        schedule_next_loop(race_id, race.loop_duration_minutes)
+        schedule_next_loop(race_id, race.loop_duration_minutes, race.loop_start_utc)
 
     return race
 
@@ -137,6 +141,13 @@ async def finish_race(race_id: int, db: Session = Depends(get_db)):
     return {"ok": True}
 
 
+@router.get("/{race_id}/scheduler-status")
+def scheduler_status(race_id: int):
+    """Sjekk status på planlagt auto-start."""
+    from scheduler import get_job_info
+    return get_job_info(race_id)
+
+
 async def _advance_loop(race: models.Race, db: Session):
     """Intern: marker DNC og start neste runde."""
     if race.dnc_auto_assign:
@@ -145,7 +156,6 @@ async def _advance_loop(race: models.Race, db: Session):
                 p.status = models.RunnerStatus.DNC
                 _log(db, race.id, "status_change", {"status": "dnc", "auto": True}, bib=p.bib_number)
 
-    # Løpere som hviler blir aktive igjen
     for p in race.participants:
         if p.status == models.RunnerStatus.ACTIVE_RESTING:
             p.status = models.RunnerStatus.ACTIVE_RUNNING
@@ -186,10 +196,8 @@ def export_csv(race_id: int, db: Session = Depends(get_db)):
     output = io.StringIO()
     writer = csv.writer(output)
 
-    # Finn maks antall runder
     max_loops = max((p.loops_completed for p in participants), default=0)
 
-    # Header
     header = ["Rank", "Bib", "FirstName", "LastName", "Gender", "Age", "Status", "LoopsCompleted", "TotalKm"]
     for i in range(1, max_loops + 1):
         header.append(f"Loop{i}_Time")
