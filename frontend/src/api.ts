@@ -1,53 +1,68 @@
 import axios from 'axios'
 
-const api = axios.create({
-  baseURL: '/api',
-})
-
+const api = axios.create({ baseURL: '/api' })
 export default api
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export type RaceType = 'backyard_ultra' | 'track_10k'
-export type ParticipantStatus = 'active' | 'finished' | 'rtc' | 'dnf' | 'dns'
+
+export type RunnerStatus =
+  | 'active_running'
+  | 'active_resting'
+  | 'rtc'
+  | 'dnc'
+  | 'over'
+  | 'dns'
+  | 'dsq'
+  | 'winner'
 
 export interface Race {
   id: number
   name: string
   race_type: RaceType
-  date: string | null
+  race_date: string | null
   location: string | null
-  lap_distance_km: number
-  lap_time_minutes: number
-  rfid_cooldown_seconds: number
+  loop_distance_km: number
+  loop_duration_minutes: number
+  loop_start_time: string
+  chip_lockout_seconds: number
+  grace_period_seconds: number
+  auto_start_next_loop: boolean
+  dnc_auto_assign: boolean
   is_active: boolean
   is_finished: boolean
-  current_lap: number
-  lap_start_time: string | null
+  current_loop: number
+  loop_start_utc: string | null
   created_at: string
 }
 
-export interface Lap {
+export interface Split {
   id: number
-  lap_number: number
-  finish_time: string
-  lap_duration_seconds: number | null
+  loop_number: number
+  finish_time_utc: string
+  loop_duration_secs: number | null
   recorded_by: string
+  is_over_time: boolean
 }
 
 export interface Participant {
   id: number
   race_id: number
-  name: string
+  first_name: string
+  last_name: string | null
   bib_number: number
-  rfid_tag: string | null
-  status: ParticipantStatus
-  laps_completed: number
-  total_distance_km: number
-  laps: Lap[]
+  gender: string | null
+  age: number | null
+  chip_id_1: string | null
+  chip_id_2: string | null
+  status: RunnerStatus
+  loops_completed: number
+  total_km: number
+  splits: Split[]
 }
 
-// ─── Race API ─────────────────────────────────────────────────────────────────
+// ─── Race ─────────────────────────────────────────────────────────────────────
 
 export const getRaces = () => api.get<Race[]>('/races/').then(r => r.data)
 export const getRace = (id: number) => api.get<Race>(`/races/${id}`).then(r => r.data)
@@ -55,15 +70,16 @@ export const createRace = (data: Partial<Race>) => api.post<Race>('/races/', dat
 export const updateRace = (id: number, data: Partial<Race>) => api.patch<Race>(`/races/${id}`, data).then(r => r.data)
 export const deleteRace = (id: number) => api.delete(`/races/${id}`)
 export const startRace = (id: number) => api.post<Race>(`/races/${id}/start`).then(r => r.data)
-export const nextLap = (id: number) => api.post<Race>(`/races/${id}/next-lap`).then(r => r.data)
+export const nextLoop = (id: number) => api.post<Race>(`/races/${id}/next-loop`).then(r => r.data)
 export const finishRace = (id: number) => api.post(`/races/${id}/finish`)
+export const exportCsv = (id: number) => `${api.defaults.baseURL}/races/${id}/export/csv`
 
-// ─── Participant API ──────────────────────────────────────────────────────────
+// ─── Participants ─────────────────────────────────────────────────────────────
 
 export const getParticipants = (raceId: number) =>
   api.get<Participant[]>(`/races/${raceId}/participants/`).then(r => r.data)
 
-export const addParticipant = (raceId: number, data: { name: string; bib_number: number; rfid_tag?: string }) =>
+export const addParticipant = (raceId: number, data: Partial<Participant>) =>
   api.post<Participant>(`/races/${raceId}/participants/`, data).then(r => r.data)
 
 export const updateParticipant = (raceId: number, participantId: number, data: Partial<Participant>) =>
@@ -72,25 +88,60 @@ export const updateParticipant = (raceId: number, participantId: number, data: P
 export const removeParticipant = (raceId: number, participantId: number) =>
   api.delete(`/races/${raceId}/participants/${participantId}`)
 
-export const registerLap = (raceId: number, participantId: number, finishTime?: string) =>
-  api.post<Participant>(`/races/${raceId}/participants/${participantId}/lap`, {
-    finish_time: finishTime || null
+export const registerSplit = (raceId: number, participantId: number, finishTimeUtc?: string) =>
+  api.post<Participant>(`/races/${raceId}/participants/${participantId}/split`, {
+    finish_time_utc: finishTimeUtc || null
   }).then(r => r.data)
 
-export const editLap = (raceId: number, participantId: number, lapId: number, finishTime: string) =>
-  api.patch<Lap>(`/races/${raceId}/participants/${participantId}/laps/${lapId}`, {
-    finish_time: finishTime
+export const editSplit = (raceId: number, participantId: number, splitId: number, finishTimeUtc: string) =>
+  api.patch<Split>(`/races/${raceId}/participants/${participantId}/splits/${splitId}`, {
+    finish_time_utc: finishTimeUtc
   }).then(r => r.data)
 
-export const deleteLap = (raceId: number, participantId: number, lapId: number) =>
-  api.delete(`/races/${raceId}/participants/${participantId}/laps/${lapId}`)
+export const deleteSplit = (raceId: number, participantId: number, splitId: number) =>
+  api.delete(`/races/${raceId}/participants/${participantId}/splits/${splitId}`)
 
-export const finishParticipant = (raceId: number, participantId: number, lastLap?: number) =>
-  api.post<Participant>(`/races/${raceId}/participants/${participantId}/finish`, {
-    last_lap: lastLap ?? null
-  }).then(r => r.data)
+export const massRtc = (raceId: number, bibNumbers: number[]) =>
+  api.post(`/races/${raceId}/participants/mass-rtc`, { bib_numbers: bibNumbers })
 
-export const getLastLap = (raceId: number, participantId: number) =>
-  api.get<{ participant_id: number; laps_completed: number; last_lap_number: number; last_finish_time: string | null }>(
-    `/races/${raceId}/participants/${participantId}/last-lap`
+export const csvPreview = (raceId: number, file: File) => {
+  const form = new FormData()
+  form.append('file', file)
+  return api.post<{ headers: string[]; preview: Record<string, string>[] }>(
+    `/races/${raceId}/participants/csv-preview`, form
   ).then(r => r.data)
+}
+
+export const csvImport = (raceId: number, file: File, mapping: object) => {
+  const form = new FormData()
+  form.append('file', file)
+  form.append('mapping', JSON.stringify(mapping))
+  return api.post<{ added: number; skipped: number }>(
+    `/races/${raceId}/participants/csv-import`, form
+  ).then(r => r.data)
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+export function fullName(p: Participant): string {
+  return [p.first_name, p.last_name].filter(Boolean).join(' ')
+}
+
+export function toLocalInputValue(isoUtc: string): string {
+  const d = new Date(isoUtc.endsWith('Z') ? isoUtc : isoUtc + 'Z')
+  const pad = (n: number) => n.toString().padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+export function toUtcIso(localValue: string): string {
+  return new Date(localValue).toISOString()
+}
+
+export function formatDuration(secs: number | null | undefined): string {
+  if (!secs && secs !== 0) return '–'
+  const h = Math.floor(secs / 3600)
+  const m = Math.floor((secs % 3600) / 60)
+  const s = Math.floor(secs % 60)
+  if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
+  return `${m}:${s.toString().padStart(2, '0')}`
+}

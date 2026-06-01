@@ -8,7 +8,6 @@ from routers import races, participants, rfid
 from ws_manager import manager
 from scheduler import start_scheduler, stop_scheduler
 
-# Opprett alle tabeller ved oppstart
 Base.metadata.create_all(bind=engine)
 
 
@@ -21,14 +20,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Løpesystem API",
-    description="Skreddersydd tidtakingssystem for ultraløp",
-    version="0.2.0",
+    description="Skreddersydd tidtakingssystem for Backyard Ultra og andre løpsformater",
+    version="0.3.0",
     lifespan=lifespan
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -41,7 +40,7 @@ app.include_router(rfid.router)
 
 @app.get("/")
 def root():
-    return {"message": "Løpesystem API er oppe og kjører 🏃", "version": "0.2.0"}
+    return {"message": "Løpesystem API v0.3.0 🏃", "docs": "/docs"}
 
 
 @app.websocket("/ws/races/{race_id}")

@@ -7,3 +7,5 @@ requests==2.32.3
 websockets==13.1
 apscheduler==3.10.4
 aiofiles==24.1.0
+python-multipart==0.0.9
+openpyxl==3.1.5
