@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +14,9 @@ Base.metadata.create_all(bind=engine)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    start_scheduler()
+    # Send FastAPIs event loop til scheduler slik at async-kode kan kjøres fra bakgrunnstråd
+    loop = asyncio.get_event_loop()
+    start_scheduler(loop)
     yield
     stop_scheduler()
 
@@ -21,7 +24,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Løpesystem API",
     description="Skreddersydd tidtakingssystem for Backyard Ultra og andre løpsformater",
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan
 )
 
@@ -40,7 +43,7 @@ app.include_router(rfid.router)
 
 @app.get("/")
 def root():
-    return {"message": "Løpesystem API v0.3.0 🏃", "docs": "/docs"}
+    return {"message": "Løpesystem API v0.4.0 🏃", "docs": "/docs"}
 
 
 @app.websocket("/ws/races/{race_id}")
