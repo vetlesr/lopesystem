@@ -104,6 +104,36 @@ export const deleteSplit = (raceId: number, participantId: number, splitId: numb
 export const massRtc = (raceId: number, bibNumbers: number[]) =>
   api.post(`/races/${raceId}/participants/mass-rtc`, { bib_numbers: bibNumbers })
 
+// Rediger rundetid (sekunder) direkte
+export const editSplitDuration = (raceId: number, participantId: number, splitId: number, durationSecs: number) =>
+  api.patch<Split>(`/races/${raceId}/participants/${participantId}/splits/${splitId}`, {
+    loop_duration_secs: durationSecs
+  }).then(r => r.data)
+
+// ─── Inaktive chip-avlesninger ────────────────────────────────────────────────
+
+export interface InactiveChip {
+  chip_id: string
+  race_id: number
+  participant_id: number
+  participant_name: string
+  bib_number: number
+  status: RunnerStatus
+  loops_completed: number
+  first_seen: string
+  last_seen: string
+  count: number
+}
+
+export const getInactiveChips = (raceId: number) =>
+  api.get<InactiveChip[]>(`/races/${raceId}/inactive-chips`).then(r => r.data)
+
+export const dismissInactiveChip = (raceId: number, chipId: string) =>
+  api.delete(`/races/${raceId}/inactive-chips/${chipId}`)
+
+export const restoreInactiveChip = (raceId: number, chipId: string) =>
+  api.post(`/races/${raceId}/inactive-chips/${chipId}/restore`).then(r => r.data)
+
 export const csvPreview = (raceId: number, file: File) => {
   const form = new FormData()
   form.append('file', file)

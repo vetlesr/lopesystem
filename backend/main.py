@@ -6,6 +6,7 @@ import uvicorn
 
 from database import engine, Base
 from routers import races, participants, rfid
+from routers.rfid import inactive_router
 from ws_manager import manager
 from scheduler import start_scheduler, stop_scheduler
 
@@ -39,6 +40,7 @@ app.add_middleware(
 app.include_router(races.router)
 app.include_router(participants.router)
 app.include_router(rfid.router)
+app.include_router(inactive_router)
 
 
 @app.get("/")
@@ -46,7 +48,7 @@ def root():
     return {"message": "Løpesystem API v0.4.0 🏃", "docs": "/docs"}
 
 
-@app.websocket("/ws/races/{race_id}")
+@app.websocket("/ws/race/{race_id}")
 async def websocket_endpoint(websocket: WebSocket, race_id: int):
     await manager.connect(race_id, websocket)
     try:

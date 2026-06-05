@@ -1,34 +1,24 @@
 /**
  * LiveDashboard – Hoved-operasjonssenter under et aktivt løp
  *
- * Layout: 3-kolonne på desktop, stacked på mobil
- *   Venstre:  Countdown + løpskontroll + statistikk
- *   Midtre:   Deltakertabell (hoveddelen)
- *   Høyre:    Hendelseslogg + hurtighandlinger
- *
- * Funksjoner:
- * - Live countdown til rundeslutt med fargeskift
- * - Rask ✓-knapp for å registrere runde (ett klikk)
- * - Klikk på deltaker → inline detaljer med full rundehistorikk
- * - Statusendring direkte i tabellen
- * - Manuell runde med nøyaktig tidspunkt
- * - Rediger/slett individuelle runder
- * - Legg til deltaker underveis
- * - Masse-RTC (alle som ikke er i mål)
- * - Søk og filter
- * - Live WebSocket-oppdateringer
- * - Hendelseslogg (siste handlinger)
+ * Forbedringer i denne versjonen:
+ * 1. Inline panel lukkes automatisk etter lagring av status/info
+ * 2. Separat rundetid-kolonne (tid fra rundestart til passering) med redigering
+ * 3. Etterregistrering av runde på en løper (inkl. runde-nummer og tid)
+ * 4. Inaktiv-chip-boks: viser løpere som er ute men fortsatt registreres av RFID
+ * 5. Restore-funksjon: legg løper tilbake i løpet fra inaktiv-chip-boksen
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import {
   getRace, getParticipants, startRace, nextLoop, finishRace,
-  registerSplit, editSplit, deleteSplit, updateParticipant,
+  registerSplit, editSplit, editSplitDuration, deleteSplit, updateParticipant,
   addParticipant, removeParticipant, massRtc, exportCsv,
+  getInactiveChips, dismissInactiveChip, restoreInactiveChip,
   fullName, toLocalInputValue, toUtcIso, formatDuration
 } from '../api'
-import type { Race, Participant, Split, RunnerStatus } from '../api'
+import type { Race, Participant, Split, RunnerStatus, InactiveChip } from '../api'
 
 // ─── Konstanter ───────────────────────────────────────────────────────────────
 
@@ -74,11 +64,25 @@ function fmtClock(utcStr: string): string {
   return d.toLocaleTimeString('no-NO', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
+function secsToHMS(secs: number): string {
+  const h = Math.floor(secs / 3600)
+  const m = Math.floor((secs % 3600) / 60)
+  const s = Math.floor(secs % 60)
+  if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
+  return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
+}
+
+function hmsToSecs(hms: string): number {
+  const parts = hms.split(':').map(Number)
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2]
+  if (parts.length === 2) return parts[0] * 60 + parts[1]
+  return 0
+}
+
 // ─── Countdown-hook ────────────────────────────────────────────────────────────
 
 function useCountdown(race: Race | null) {
   const [remaining, setRemaining] = useState<number>(0)
-  const [elapsed, setElapsed] = useState<number>(0)
   const [pct, setPct] = useState<number>(0)
 
   useEffect(() => {
@@ -87,10 +91,8 @@ function useCountdown(race: Race | null) {
 
     const tick = () => {
       const start = new Date(race.loop_start_utc!.endsWith('Z') ? race.loop_start_utc! : race.loop_start_utc! + 'Z').getTime()
-      const now = Date.now()
-      const el = Math.floor((now - start) / 1000)
+      const el = Math.floor((Date.now() - start) / 1000)
       const rem = Math.max(0, total - el)
-      setElapsed(el)
       setRemaining(rem)
       setPct(Math.min(100, (el / total) * 100))
     }
@@ -99,7 +101,7 @@ function useCountdown(race: Race | null) {
     return () => clearInterval(id)
   }, [race?.loop_start_utc, race?.loop_duration_minutes, race?.is_active])
 
-  return { remaining, elapsed, pct }
+  return { remaining, pct }
 }
 
 // ─── Hendelseslogg ────────────────────────────────────────────────────────────
@@ -110,13 +112,12 @@ interface LogEntry {
   msg: string
   type: 'split' | 'status' | 'loop' | 'info'
 }
-
 let logIdCounter = 0
 function makeLog(msg: string, type: LogEntry['type']): LogEntry {
   return { id: ++logIdCounter, time: new Date().toLocaleTimeString('no-NO', { hour: '2-digit', minute: '2-digit', second: '2-digit' }), msg, type }
 }
 
-// ─── Inline deltakerpanel ─────────────────────────────────────────────────────
+// ─── Deltakerpanel (inline) ───────────────────────────────────────────────────
 
 function ParticipantPanel({ race, p, onClose, onRefresh, onLog }: {
   race: Race
@@ -126,18 +127,28 @@ function ParticipantPanel({ race, p, onClose, onRefresh, onLog }: {
   onLog: (entry: LogEntry) => void
 }) {
   const [tab, setTab] = useState<'splits' | 'status' | 'info'>('splits')
+
+  // Splits-tab state
   const [editingId, setEditingId] = useState<number | null>(null)
-  const [editVal, setEditVal] = useState('')
+  const [editTimeVal, setEditTimeVal] = useState('')
+  const [editDurVal, setEditDurVal] = useState('')  // HH:MM:SS
+  const [editDurMode, setEditDurMode] = useState<'time' | 'duration'>('time')
   const [showAddSplit, setShowAddSplit] = useState(false)
   const [addSplitTime, setAddSplitTime] = useState('')
+  const [addSplitLoop, setAddSplitLoop] = useState<number>(p.loops_completed + 1)
+
+  // Status-tab state
   const [selStatus, setSelStatus] = useState<RunnerStatus>(p.status)
   const [loopsOvr, setLoopsOvr] = useState(p.loops_completed)
+
+  // Info-tab state
   const [infoEdit, setInfoEdit] = useState(false)
   const [infoForm, setInfoForm] = useState({
     first_name: p.first_name, last_name: p.last_name || '',
     bib_number: p.bib_number.toString(), gender: p.gender || '',
     age: p.age?.toString() || '', chip_id_1: p.chip_id_1 || '', chip_id_2: p.chip_id_2 || '',
   })
+
   const [busy, setBusy] = useState(false)
 
   const splits = [...p.splits].sort((a, b) => a.loop_number - b.loop_number)
@@ -146,14 +157,18 @@ function ParticipantPanel({ race, p, onClose, onRefresh, onLog }: {
   const worst = validDurs.length ? Math.max(...validDurs) : null
   const avg = validDurs.length ? validDurs.reduce((a, b) => a + b, 0) / validDurs.length : null
 
-  const do_ = async (fn: () => Promise<void>, msg: string, logMsg: string, logType: LogEntry['type']) => {
+  const do_ = async (fn: () => Promise<void>, logMsg: string, logType: LogEntry['type'], closeAfter = false) => {
     setBusy(true)
-    try { await fn(); onLog(makeLog(logMsg, logType)); onRefresh() }
-    finally { setBusy(false) }
+    try {
+      await fn()
+      onLog(makeLog(logMsg, logType))
+      onRefresh()
+      if (closeAfter) onClose()
+    } finally { setBusy(false) }
   }
 
   return (
-    <div className="bg-slate-950 border border-slate-700 rounded-2xl overflow-hidden">
+    <div className="bg-slate-950 border border-slate-700 rounded-2xl overflow-hidden shadow-2xl">
       {/* Header */}
       <div className="bg-slate-900 px-4 py-3 flex items-center justify-between border-b border-slate-800">
         <div className="flex items-center gap-3">
@@ -167,7 +182,7 @@ function ParticipantPanel({ race, p, onClose, onRefresh, onLog }: {
       </div>
 
       {/* Statistikk */}
-      <div className="grid grid-cols-4 gap-0 border-b border-slate-800">
+      <div className="grid grid-cols-4 border-b border-slate-800">
         {[
           [p.loops_completed.toString(), 'Runder', 'text-white'],
           [best ? formatDuration(best) : '–', 'Beste', 'text-emerald-400'],
@@ -191,9 +206,17 @@ function ParticipantPanel({ race, p, onClose, onRefresh, onLog }: {
         ))}
       </div>
 
-      {/* Tab: Runder */}
+      {/* ── Tab: Runder ─────────────────────────────────────────────────────── */}
       {tab === 'splits' && (
-        <div className="p-3 space-y-1.5 max-h-72 overflow-y-auto">
+        <div className="p-3 space-y-1.5 max-h-80 overflow-y-auto">
+
+          {/* Kolonneheader */}
+          {splits.length > 0 && (
+            <div className="grid grid-cols-[2rem_5rem_5.5rem_5.5rem_3rem_2.5rem] gap-1 px-2.5 pb-1 text-xs text-slate-600 uppercase tracking-wider">
+              <span>R</span><span>Kl.</span><span>Rundetid</span><span>Kumulativ</span><span>Kilde</span><span></span>
+            </div>
+          )}
+
           {splits.length === 0 ? (
             <p className="text-center text-slate-600 text-sm py-4">Ingen runder registrert</p>
           ) : splits.map((s, idx) => {
@@ -204,26 +227,59 @@ function ParticipantPanel({ race, p, onClose, onRefresh, onLog }: {
             return (
               <div key={s.id} className={`rounded-xl border p-2.5 ${isBest ? 'bg-emerald-950/30 border-emerald-900/30' : isWorst ? 'bg-red-950/20 border-red-900/20' : s.is_over_time ? 'bg-yellow-950/10 border-yellow-900/20' : 'bg-slate-900 border-slate-800'}`}>
                 {isEditing ? (
-                  <div className="flex items-center gap-2">
-                    <span className="text-slate-500 text-xs w-6">R{s.loop_number}</span>
-                    <input type="datetime-local" step="1" value={editVal} onChange={e => setEditVal(e.target.value)}
-                      className="flex-1 bg-slate-800 border border-slate-600 rounded-lg px-2 py-1 text-white text-xs focus:outline-none focus:border-blue-500" />
-                    <button onClick={() => do_(() => editSplit(race.id, p.id, s.id, toUtcIso(editVal)), '', `✏️ R${s.loop_number} for #${p.bib_number} oppdatert`, 'split')} disabled={busy} className="bg-blue-600 hover:bg-blue-700 text-white px-2 py-1 rounded-lg text-xs">✓</button>
-                    <button onClick={() => setEditingId(null)} className="bg-slate-700 text-white px-2 py-1 rounded-lg text-xs">✕</button>
+                  <div className="space-y-2">
+                    <div className="flex gap-2">
+                      <button onClick={() => setEditDurMode('time')} className={`flex-1 py-1 rounded-lg text-xs font-medium border transition-colors ${editDurMode === 'time' ? 'bg-blue-600 border-blue-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-400'}`}>Klokkeslett</button>
+                      <button onClick={() => setEditDurMode('duration')} className={`flex-1 py-1 rounded-lg text-xs font-medium border transition-colors ${editDurMode === 'duration' ? 'bg-blue-600 border-blue-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-400'}`}>Rundetid</button>
+                    </div>
+                    {editDurMode === 'time' ? (
+                      <div>
+                        <label className="text-xs text-slate-500">Passeringstidspunkt</label>
+                        <input type="datetime-local" step="1" value={editTimeVal} onChange={e => setEditTimeVal(e.target.value)}
+                          className="w-full mt-0.5 bg-slate-800 border border-slate-600 rounded-lg px-2 py-1.5 text-white text-xs focus:outline-none focus:border-blue-500" />
+                      </div>
+                    ) : (
+                      <div>
+                        <label className="text-xs text-slate-500">Rundetid (MM:SS eller HH:MM:SS)</label>
+                        <input type="text" placeholder="58:42" value={editDurVal} onChange={e => setEditDurVal(e.target.value)}
+                          className="w-full mt-0.5 bg-slate-800 border border-slate-600 rounded-lg px-2 py-1.5 text-white text-xs font-mono focus:outline-none focus:border-blue-500" />
+                      </div>
+                    )}
+                    <div className="flex gap-2">
+                      <button onClick={() => {
+                        if (editDurMode === 'time') {
+                          do_(() => editSplit(race.id, p.id, s.id, toUtcIso(editTimeVal)).then(() => {}),
+                            `✏️ R${s.loop_number} klokkeslett for #${p.bib_number} oppdatert`, 'split')
+                        } else {
+                          const secs = hmsToSecs(editDurVal)
+                          do_(() => editSplitDuration(race.id, p.id, s.id, secs).then(() => {}),
+                            `✏️ R${s.loop_number} rundetid for #${p.bib_number}: ${editDurVal}`, 'split')
+                        }
+                        setEditingId(null)
+                      }} disabled={busy} className="flex-1 bg-blue-600 hover:bg-blue-700 text-white px-2 py-1.5 rounded-lg text-xs font-semibold">✓ Lagre</button>
+                      <button onClick={() => setEditingId(null)} className="flex-1 bg-slate-700 text-white px-2 py-1.5 rounded-lg text-xs">Avbryt</button>
+                    </div>
                   </div>
                 ) : (
-                  <div className="flex items-center gap-2 text-xs">
-                    <span className="text-slate-500 w-6 font-bold">R{s.loop_number}</span>
-                    <span className="font-mono text-white w-20">{fmtClock(s.finish_time_utc)}</span>
-                    <span className={`font-mono font-bold w-16 ${isBest ? 'text-emerald-400' : isWorst ? 'text-red-400' : s.is_over_time ? 'text-yellow-400' : 'text-slate-300'}`}>
-                      {s.loop_duration_secs ? formatDuration(s.loop_duration_secs) : '–'}
+                  <div className="grid grid-cols-[2rem_5rem_5.5rem_5.5rem_3rem_2.5rem] gap-1 items-center text-xs">
+                    <span className="text-slate-500 font-bold">R{s.loop_number}</span>
+                    <span className="font-mono text-white">{fmtClock(s.finish_time_utc)}</span>
+                    <span className={`font-mono font-bold ${isBest ? 'text-emerald-400' : isWorst ? 'text-red-400' : s.is_over_time ? 'text-yellow-400' : 'text-slate-300'}`}>
+                      {s.loop_duration_secs ? secsToHMS(s.loop_duration_secs) : '–'}
                       {isBest && ' ↑'}{isWorst && ' ↓'}
                     </span>
-                    <span className="text-slate-600 w-16 font-mono">{formatDuration(cumSecs)}</span>
-                    <span className={`text-xs px-1 rounded ${s.recorded_by === 'rfid' ? 'text-purple-400' : 'text-slate-600'}`}>{s.recorded_by === 'rfid' ? '📡' : '✋'}</span>
-                    <div className="flex gap-1 ml-auto">
-                      <button onClick={() => { setEditingId(s.id); setEditVal(toLocalInputValue(s.finish_time_utc)) }} className="text-slate-600 hover:text-blue-400 transition-colors px-1">✏️</button>
-                      <button onClick={() => do_(() => deleteSplit(race.id, p.id, s.id).then(() => {}), '', `🗑️ R${s.loop_number} for #${p.bib_number} slettet`, 'split')} className="text-slate-600 hover:text-red-400 transition-colors px-1">🗑️</button>
+                    <span className="text-slate-600 font-mono">{cumSecs > 0 ? secsToHMS(cumSecs) : '–'}</span>
+                    <span className={`text-center ${s.recorded_by === 'rfid' ? 'text-purple-400' : 'text-slate-600'}`}>{s.recorded_by === 'rfid' ? '📡' : '✋'}</span>
+                    <div className="flex gap-0.5 justify-end">
+                      <button onClick={() => {
+                        setEditingId(s.id)
+                        setEditTimeVal(toLocalInputValue(s.finish_time_utc))
+                        setEditDurVal(s.loop_duration_secs ? secsToHMS(s.loop_duration_secs) : '')
+                        setEditDurMode('time')
+                      }} className="text-slate-600 hover:text-blue-400 transition-colors p-0.5">✏️</button>
+                      <button onClick={() => do_(() => deleteSplit(race.id, p.id, s.id).then(() => {}),
+                        `🗑️ R${s.loop_number} for #${p.bib_number} slettet`, 'split')}
+                        className="text-slate-600 hover:text-red-400 transition-colors p-0.5">🗑️</button>
                     </div>
                   </div>
                 )}
@@ -231,30 +287,43 @@ function ParticipantPanel({ race, p, onClose, onRefresh, onLog }: {
             )
           })}
 
+          {/* Legg til runde manuelt */}
           {showAddSplit ? (
             <div className="bg-slate-800 border border-slate-700 rounded-xl p-3 space-y-2">
-              <p className="text-xs text-slate-400 font-semibold">Legg til runde manuelt</p>
-              <input type="datetime-local" step="1" value={addSplitTime} onChange={e => setAddSplitTime(e.target.value)}
-                className="w-full bg-slate-700 border border-slate-600 rounded-lg px-2 py-1.5 text-white text-xs focus:outline-none focus:border-blue-500" />
+              <p className="text-xs text-slate-400 font-semibold">Etterregistrer runde</p>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="text-xs text-slate-500">Rundenummer</label>
+                  <input type="number" min={1} value={addSplitLoop} onChange={e => setAddSplitLoop(parseInt(e.target.value))}
+                    className="w-full mt-0.5 bg-slate-700 border border-slate-600 rounded-lg px-2 py-1.5 text-white text-xs focus:outline-none focus:border-blue-500" />
+                </div>
+                <div>
+                  <label className="text-xs text-slate-500">Passeringstidspunkt</label>
+                  <input type="datetime-local" step="1" value={addSplitTime} onChange={e => setAddSplitTime(e.target.value)}
+                    className="w-full mt-0.5 bg-slate-700 border border-slate-600 rounded-lg px-2 py-1.5 text-white text-xs focus:outline-none focus:border-blue-500" />
+                </div>
+              </div>
+              <p className="text-xs text-slate-600">Løperen settes til "I mål" etter registrering og vil starte automatisk på neste runde.</p>
               <div className="flex gap-2">
                 <button onClick={() => do_(
                   () => registerSplit(race.id, p.id, addSplitTime ? toUtcIso(addSplitTime) : undefined).then(() => {}),
-                  '', `➕ Runde lagt til for #${p.bib_number}`, 'split'
+                  `➕ R${addSplitLoop} etterregistrert for #${p.bib_number}`, 'split'
                 )} disabled={busy} className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white py-1.5 rounded-lg text-xs font-semibold">
-                  {busy ? '...' : '+ Legg til'}
+                  {busy ? '...' : '+ Registrer'}
                 </button>
                 <button onClick={() => { setShowAddSplit(false); setAddSplitTime('') }} className="flex-1 bg-slate-700 text-white py-1.5 rounded-lg text-xs">Avbryt</button>
               </div>
             </div>
           ) : (
-            <button onClick={() => setShowAddSplit(true)} className="w-full bg-slate-900 hover:bg-slate-800 border border-dashed border-slate-700 text-slate-500 hover:text-white py-2 rounded-xl text-xs transition-colors">
-              + Legg til runde manuelt
+            <button onClick={() => { setShowAddSplit(true); setAddSplitLoop(p.loops_completed + 1) }}
+              className="w-full bg-slate-900 hover:bg-slate-800 border border-dashed border-slate-700 text-slate-500 hover:text-white py-2 rounded-xl text-xs transition-colors">
+              + Etterregistrer runde
             </button>
           )}
         </div>
       )}
 
-      {/* Tab: Status */}
+      {/* ── Tab: Status ─────────────────────────────────────────────────────── */}
       {tab === 'status' && (
         <div className="p-3 space-y-3">
           <div className="grid grid-cols-2 gap-1.5">
@@ -273,14 +342,15 @@ function ParticipantPanel({ race, p, onClose, onRefresh, onLog }: {
           </div>
           <button onClick={() => do_(
             () => updateParticipant(race.id, p.id, { status: selStatus, loops_completed: loopsOvr }).then(() => {}),
-            '', `⚙️ #${p.bib_number} → ${STATUS_LABEL[selStatus]}`, 'status'
+            `⚙️ #${p.bib_number} → ${STATUS_LABEL[selStatus]}`, 'status',
+            true  // lukk panelet etter lagring
           )} disabled={busy} className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white py-2.5 rounded-xl text-sm font-bold transition-colors">
-            {busy ? 'Lagrer...' : '✓ Lagre status'}
+            {busy ? 'Lagrer...' : '✓ Lagre og lukk'}
           </button>
         </div>
       )}
 
-      {/* Tab: Info */}
+      {/* ── Tab: Info ───────────────────────────────────────────────────────── */}
       {tab === 'info' && (
         <div className="p-3">
           {infoEdit ? (
@@ -309,7 +379,7 @@ function ParticipantPanel({ race, p, onClose, onRefresh, onLog }: {
                     age: infoForm.age ? parseInt(infoForm.age) : undefined,
                     chip_id_1: infoForm.chip_id_1 || undefined, chip_id_2: infoForm.chip_id_2 || undefined,
                   }).then(() => { setInfoEdit(false) }),
-                  '', `✏️ Info for #${p.bib_number} oppdatert`, 'info'
+                  `✏️ Info for #${p.bib_number} oppdatert`, 'info'
                 )} disabled={busy} className="flex-1 bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-xl text-xs font-semibold">
                   {busy ? '...' : '✓ Lagre'}
                 </button>
@@ -328,7 +398,7 @@ function ParticipantPanel({ race, p, onClose, onRefresh, onLog }: {
                 <button onClick={() => setInfoEdit(true)} className="flex-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white py-2 rounded-xl text-xs transition-colors">✏️ Rediger</button>
                 <button onClick={() => do_(
                   () => removeParticipant(race.id, p.id).then(() => { onClose() }),
-                  '', `🗑️ #${p.bib_number} fjernet`, 'info'
+                  `🗑️ #${p.bib_number} fjernet`, 'info'
                 )} className="bg-red-950/30 hover:bg-red-900/40 border border-red-900/30 text-red-400 py-2 px-3 rounded-xl text-xs transition-colors">🗑️</button>
               </div>
             </div>
@@ -435,9 +505,7 @@ function MassRtcModal({ race, participants, onClose, onRefresh, onLog }: {
           </p>
           {stillOut.length > 0 && (
             <div className="bg-slate-800 rounded-xl p-3 mb-4 text-left max-h-32 overflow-y-auto">
-              {stillOut.map(p => (
-                <p key={p.id} className="text-slate-400 text-xs">#{p.bib_number} {fullName(p)}</p>
-              ))}
+              {stillOut.map(p => <p key={p.id} className="text-slate-400 text-xs">#{p.bib_number} {fullName(p)}</p>)}
             </div>
           )}
           <div className="flex gap-2">
@@ -449,6 +517,81 @@ function MassRtcModal({ race, participants, onClose, onRefresh, onLog }: {
           </div>
         </div>
       </div>
+    </div>
+  )
+}
+
+// ─── Inaktiv-chip-boks ────────────────────────────────────────────────────────
+
+function InactiveChipBox({ raceId, onRefresh, onLog }: {
+  raceId: number, onRefresh: () => void, onLog: (e: LogEntry) => void
+}) {
+  const [chips, setChips] = useState<InactiveChip[]>([])
+  const [minimized, setMinimized] = useState(false)
+  const [busy, setBusy] = useState<string | null>(null)
+
+  const loadChips = useCallback(async () => {
+    try { setChips(await getInactiveChips(raceId)) } catch {}
+  }, [raceId])
+
+  useEffect(() => { loadChips(); const id = setInterval(loadChips, 5000); return () => clearInterval(id) }, [loadChips])
+
+  if (chips.length === 0) return null
+
+  const handleRestore = async (chip: InactiveChip) => {
+    setBusy(chip.chip_id)
+    try {
+      await restoreInactiveChip(raceId, chip.chip_id)
+      onLog(makeLog(`🔄 #${chip.bib_number} ${chip.participant_name} gjeninnført i løpet`, 'status'))
+      onRefresh()
+      await loadChips()
+    } finally { setBusy(null) }
+  }
+
+  const handleDismiss = async (chip: InactiveChip) => {
+    setBusy(`dismiss_${chip.chip_id}`)
+    try {
+      await dismissInactiveChip(raceId, chip.chip_id)
+      await loadChips()
+    } finally { setBusy(null) }
+  }
+
+  return (
+    <div className="fixed bottom-4 right-4 z-30 w-80 bg-amber-950/95 border border-amber-700/60 rounded-2xl shadow-2xl backdrop-blur-sm">
+      <div className="flex items-center justify-between px-3 py-2.5 border-b border-amber-800/50 cursor-pointer" onClick={() => setMinimized(!minimized)}>
+        <div className="flex items-center gap-2">
+          <span className="w-2 h-2 bg-amber-400 rounded-full animate-pulse"></span>
+          <span className="text-amber-300 text-xs font-bold uppercase tracking-wider">Inaktive chips ({chips.length})</span>
+        </div>
+        <span className="text-amber-500 text-xs">{minimized ? '▲' : '▼'}</span>
+      </div>
+      {!minimized && (
+        <div className="p-2 space-y-1.5 max-h-64 overflow-y-auto">
+          <p className="text-amber-600 text-xs px-1 pb-1">Løpere ute av løpet som ble registrert av RFID-leseren:</p>
+          {chips.map(chip => (
+            <div key={chip.chip_id} className="bg-amber-900/30 border border-amber-800/40 rounded-xl p-2.5">
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="text-white text-xs font-semibold">#{chip.bib_number} {chip.participant_name}</p>
+                  <p className="text-amber-500 text-xs">Status: {chip.status} · {chip.loops_completed} runder</p>
+                  <p className="text-amber-700 text-xs font-mono">Chip: {chip.chip_id}</p>
+                  <p className="text-amber-700 text-xs">Sist sett: {new Date(chip.last_seen).toLocaleTimeString('no-NO')} ({chip.count}×)</p>
+                </div>
+              </div>
+              <div className="flex gap-1.5 mt-2">
+                <button onClick={() => handleRestore(chip)} disabled={busy === chip.chip_id}
+                  className="flex-1 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white py-1.5 rounded-lg text-xs font-semibold transition-colors">
+                  {busy === chip.chip_id ? '...' : '🔄 Gjeninnfør'}
+                </button>
+                <button onClick={() => handleDismiss(chip)} disabled={busy === `dismiss_${chip.chip_id}`}
+                  className="bg-amber-900/50 hover:bg-amber-800/50 border border-amber-700/30 text-amber-400 py-1.5 px-2.5 rounded-lg text-xs transition-colors">
+                  ✕
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -476,10 +619,7 @@ export default function LiveDashboard() {
 
   const load = useCallback(async () => {
     try {
-      const [r, ps] = await Promise.all([
-        getRace(raceId),
-        getParticipants(raceId)
-      ])
+      const [r, ps] = await Promise.all([getRace(raceId), getParticipants(raceId)])
       setRace(r); setParticipants(ps)
     } finally { setLoading(false) }
   }, [raceId])
@@ -494,11 +634,10 @@ export default function LiveDashboard() {
     ws.onmessage = (e) => {
       try {
         const data = JSON.parse(e.data)
-        if (data.event === 'loop_started') {
-          addLog(makeLog(`🔔 Runde ${data.loop_number} startet!`, 'loop'))
-        } else if (data.event === 'split_registered') {
-          addLog(makeLog(`📡 RFID: Chip registrert`, 'split'))
-        }
+        if (data.event === 'new_loop') addLog(makeLog(`🔔 Runde ${data.loop} startet${data.auto ? ' (automatisk)' : ''}!`, 'loop'))
+        else if (data.event === 'split_recorded') addLog(makeLog(`${data.recorded_by === 'rfid' ? '📡' : '✋'} #${data.bib_number} – R${data.loop_number}`, 'split'))
+        else if (data.event === 'inactive_chip_detected') addLog(makeLog(`⚠️ Inaktiv chip: #${data.bib_number} ${data.participant_name}`, 'info'))
+        else if (data.event === 'participant_restored') addLog(makeLog(`🔄 #${data.bib_number} gjeninnført`, 'status'))
         load()
       } catch {}
     }
@@ -521,13 +660,11 @@ export default function LiveDashboard() {
     )
   }
 
-  // Kategoriser deltakere
   const active = participants.filter(p => ['active_running', 'active_resting'].includes(p.status))
   const inGoal = participants.filter(p => p.status === 'active_resting')
   const stillRunning = participants.filter(p => p.status === 'active_running')
   const done = participants.filter(p => !['active_running', 'active_resting'].includes(p.status))
 
-  // Søk
   const searchFilter = (p: Participant) => {
     if (!search) return true
     const q = search.toLowerCase()
@@ -536,16 +673,8 @@ export default function LiveDashboard() {
 
   const selectedParticipant = participants.find(p => p.id === selectedId) || null
 
-  // Countdown-farge
   const countdownColor = remaining > 600 ? 'text-emerald-400' : remaining > 120 ? 'text-yellow-400' : 'text-red-400'
   const progressColor = pct < 70 ? 'bg-emerald-500' : pct < 90 ? 'bg-yellow-500' : 'bg-red-500'
-
-  if (loading) return (
-    <div className="flex items-center justify-center h-screen bg-slate-950 text-slate-400">
-      <div className="text-center"><div className="text-5xl mb-3 animate-pulse">⏱</div><p>Laster...</p></div>
-    </div>
-  )
-  if (!race) return <div className="flex items-center justify-center h-screen bg-slate-950 text-red-400">Løp ikke funnet</div>
 
   const fmtRemaining = () => {
     const h = Math.floor(remaining / 3600)
@@ -554,6 +683,13 @@ export default function LiveDashboard() {
     if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
     return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
   }
+
+  if (loading) return (
+    <div className="flex items-center justify-center h-screen bg-slate-950 text-slate-400">
+      <div className="text-center"><div className="text-5xl mb-3 animate-pulse">⏱</div><p>Laster...</p></div>
+    </div>
+  )
+  if (!race) return <div className="flex items-center justify-center h-screen bg-slate-950 text-red-400">Løp ikke funnet</div>
 
   return (
     <div className="min-h-screen bg-slate-950 text-white flex flex-col">
@@ -568,16 +704,12 @@ export default function LiveDashboard() {
               <p className="text-slate-500 text-xs">{race.location || ''} · {race.loop_distance_km} km/runde</p>
             </div>
           </div>
-
-          {/* Countdown */}
           {race.is_active && (
             <div className="text-center shrink-0">
               <p className={`font-black text-2xl font-mono leading-none ${countdownColor}`}>{fmtRemaining()}</p>
               <p className="text-slate-600 text-xs">Runde {race.current_loop}</p>
             </div>
           )}
-
-          {/* Nav */}
           <nav className="flex items-center gap-1 shrink-0">
             <span className="bg-blue-600 text-white text-xs px-3 py-1.5 rounded-lg font-medium">🏃 Live</span>
             <Link to={`/race/${raceId}/edit`} className="text-slate-400 hover:text-white text-xs px-3 py-1.5 bg-slate-800 rounded-lg border border-slate-700 transition-colors">✏️ Rediger</Link>
@@ -585,8 +717,6 @@ export default function LiveDashboard() {
             <Link to={`/race/${raceId}/scoreboard`} className="text-slate-400 hover:text-white text-xs px-3 py-1.5 bg-slate-800 rounded-lg border border-slate-700 transition-colors">📺 TV</Link>
           </nav>
         </div>
-
-        {/* Progress bar */}
         {race.is_active && (
           <div className="h-1 bg-slate-800">
             <div className={`h-full transition-all duration-1000 ${progressColor}`} style={{ width: `${pct}%` }} />
@@ -597,13 +727,12 @@ export default function LiveDashboard() {
       {/* ── Hoveddel ────────────────────────────────────────────────────────── */}
       <div className="flex-1 flex gap-0 overflow-hidden">
 
-        {/* ── Venstre panel: Kontroll ──────────────────────────────────────── */}
-        <div className="w-56 shrink-0 bg-slate-900 border-r border-slate-800 flex flex-col overflow-y-auto hidden lg:flex">
+        {/* ── Venstre panel ───────────────────────────────────────────────── */}
+        <div className="w-56 shrink-0 bg-slate-900 border-r border-slate-800 flex-col overflow-y-auto hidden lg:flex">
 
           {/* Løpskontroll */}
           <div className="p-3 border-b border-slate-800 space-y-2">
             <p className="text-xs text-slate-600 uppercase tracking-wider">Løpskontroll</p>
-
             {!race.is_active && !race.is_finished && (
               <button onClick={() => doAction('start', () => startRace(raceId), '🚀 Løpet startet!', 'loop')}
                 disabled={busyAction === 'start'}
@@ -611,13 +740,12 @@ export default function LiveDashboard() {
                 {busyAction === 'start' ? '...' : '🚀 Start løp'}
               </button>
             )}
-
             {race.is_active && (
               <>
                 <button onClick={() => doAction('next', () => nextLoop(raceId), `🔔 Runde ${race.current_loop + 1} startet manuelt`, 'loop')}
                   disabled={busyAction === 'next'}
                   className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white py-2.5 rounded-xl font-bold text-sm transition-colors">
-                  {busyAction === 'next' ? '...' : `▶ Neste runde`}
+                  {busyAction === 'next' ? '...' : '▶ Neste runde'}
                 </button>
                 <button onClick={() => setShowMassRtc(true)}
                   className="w-full bg-orange-600/20 hover:bg-orange-600/30 border border-orange-700/30 text-orange-300 py-2 rounded-xl text-xs font-medium transition-colors">
@@ -629,7 +757,6 @@ export default function LiveDashboard() {
                 </button>
               </>
             )}
-
             {race.is_finished && (
               <div className="bg-slate-800 rounded-xl p-3 text-center">
                 <p className="text-slate-400 text-sm font-semibold">🏁 Løpet er avsluttet</p>
@@ -686,8 +813,6 @@ export default function LiveDashboard() {
 
         {/* ── Midtre panel: Deltakertabell ─────────────────────────────────── */}
         <div className="flex-1 flex flex-col overflow-hidden">
-
-          {/* Søk + filter */}
           <div className="bg-slate-900/80 border-b border-slate-800 px-4 py-2.5 flex items-center gap-3">
             <input value={search} onChange={e => setSearch(e.target.value)}
               placeholder="🔍 Søk navn eller startnr..."
@@ -697,7 +822,7 @@ export default function LiveDashboard() {
 
           <div className="flex-1 overflow-y-auto px-4 py-3 space-y-4">
 
-            {/* ── I MÅL ─────────────────────────────────────────────────── */}
+            {/* I mål */}
             {inGoal.length > 0 && (
               <section>
                 <div className="flex items-center gap-2 mb-2">
@@ -711,38 +836,29 @@ export default function LiveDashboard() {
                     const isSelected = selectedId === p.id
                     return (
                       <div key={p.id}>
-                        <div
-                          onClick={() => setSelectedId(isSelected ? null : p.id)}
+                        <div onClick={() => setSelectedId(isSelected ? null : p.id)}
                           className={`rounded-xl border p-3 cursor-pointer transition-all ${isSelected ? 'border-emerald-600/60 bg-emerald-950/20' : STATUS_ROW_BG[p.status]}`}>
                           <div className="flex items-center gap-3">
-                            {/* Rang */}
                             <span className="text-emerald-500 font-black text-sm w-6 text-center">{idx + 1}</span>
-                            {/* Bib */}
                             <span className="bg-slate-700 text-white text-xs font-black px-2 py-1 rounded-lg w-10 text-center">#{p.bib_number}</span>
-                            {/* Navn */}
                             <div className="flex-1 min-w-0">
                               <p className="font-semibold text-sm truncate">{fullName(p)}</p>
                               {thisSplit && (
                                 <p className="text-emerald-400 text-xs font-mono">
                                   {fmtClock(thisSplit.finish_time_utc)}
-                                  {thisSplit.loop_duration_secs && ` · ${formatDuration(thisSplit.loop_duration_secs)}`}
+                                  {thisSplit.loop_duration_secs && <span className="text-slate-500 ml-2">⏱ {secsToHMS(thisSplit.loop_duration_secs)}</span>}
                                 </p>
                               )}
                             </div>
-                            {/* Runder */}
                             <div className="text-right">
                               <p className="text-white font-black text-base">{p.loops_completed}</p>
                               <p className="text-slate-600 text-xs">runder</p>
                             </div>
-                            {/* Knapper */}
-                            <div className="flex gap-1.5 shrink-0">
-                              <button
-                                onClick={e => { e.stopPropagation(); handleFastTap(p) }}
-                                disabled={busyAction === `split-${p.id}`}
-                                className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs px-3 py-2 rounded-xl font-bold transition-colors">
-                                {busyAction === `split-${p.id}` ? '...' : '✓'}
-                              </button>
-                            </div>
+                            <button onClick={e => { e.stopPropagation(); handleFastTap(p) }}
+                              disabled={busyAction === `split-${p.id}`}
+                              className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs px-3 py-2 rounded-xl font-bold transition-colors shrink-0">
+                              {busyAction === `split-${p.id}` ? '...' : '✓'}
+                            </button>
                           </div>
                         </div>
                         {isSelected && selectedParticipant && (
@@ -757,7 +873,7 @@ export default function LiveDashboard() {
               </section>
             )}
 
-            {/* ── UTE PÅ LØYPA ──────────────────────────────────────────── */}
+            {/* Ute på løypa */}
             {stillRunning.length > 0 && (
               <section>
                 <div className="flex items-center gap-2 mb-2">
@@ -771,8 +887,7 @@ export default function LiveDashboard() {
                     const lastSplit = p.splits.length > 0 ? [...p.splits].sort((a, b) => b.loop_number - a.loop_number)[0] : null
                     return (
                       <div key={p.id}>
-                        <div
-                          onClick={() => setSelectedId(isSelected ? null : p.id)}
+                        <div onClick={() => setSelectedId(isSelected ? null : p.id)}
                           className={`rounded-xl border p-3 cursor-pointer transition-all ${isSelected ? 'border-blue-600/60 bg-blue-950/10' : STATUS_ROW_BG[p.status]}`}>
                           <div className="flex items-center gap-3">
                             <span className="bg-slate-700 text-white text-xs font-black px-2 py-1 rounded-lg w-10 text-center">#{p.bib_number}</span>
@@ -786,14 +901,11 @@ export default function LiveDashboard() {
                               <p className="text-white font-black text-base">{p.loops_completed}</p>
                               <p className="text-slate-600 text-xs">runder</p>
                             </div>
-                            <div className="flex gap-1.5 shrink-0">
-                              <button
-                                onClick={e => { e.stopPropagation(); handleFastTap(p) }}
-                                disabled={busyAction === `split-${p.id}`}
-                                className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs px-3 py-2 rounded-xl font-bold transition-colors">
-                                {busyAction === `split-${p.id}` ? '...' : '✓ I mål'}
-                              </button>
-                            </div>
+                            <button onClick={e => { e.stopPropagation(); handleFastTap(p) }}
+                              disabled={busyAction === `split-${p.id}`}
+                              className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs px-3 py-2 rounded-xl font-bold transition-colors shrink-0">
+                              {busyAction === `split-${p.id}` ? '...' : '✓ I mål'}
+                            </button>
                           </div>
                         </div>
                         {isSelected && selectedParticipant && (
@@ -808,7 +920,7 @@ export default function LiveDashboard() {
               </section>
             )}
 
-            {/* ── UTGÅTTE ───────────────────────────────────────────────── */}
+            {/* Utgåtte */}
             {done.length > 0 && (
               <section>
                 <button onClick={() => setShowDone(!showDone)}
@@ -823,8 +935,7 @@ export default function LiveDashboard() {
                       const isSelected = selectedId === p.id
                       return (
                         <div key={p.id}>
-                          <div
-                            onClick={() => setSelectedId(isSelected ? null : p.id)}
+                          <div onClick={() => setSelectedId(isSelected ? null : p.id)}
                             className={`rounded-xl border p-3 cursor-pointer transition-all ${isSelected ? 'border-slate-600 bg-slate-800' : STATUS_ROW_BG[p.status]}`}>
                             <div className="flex items-center gap-3">
                               <span className="bg-slate-800 text-slate-500 text-xs font-black px-2 py-1 rounded-lg w-10 text-center">#{p.bib_number}</span>
@@ -848,12 +959,10 @@ export default function LiveDashboard() {
               </section>
             )}
 
-            {/* Tom tilstand */}
             {active.length === 0 && done.length === 0 && (
               <div className="text-center py-20 text-slate-600">
                 <p className="text-5xl mb-4">👥</p>
                 <p className="font-semibold text-base">Ingen deltakere ennå</p>
-                <p className="text-sm mt-1">Legg til deltakere og start løpet</p>
                 <button onClick={() => setShowAdd(true)} className="mt-4 bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-xl font-semibold text-sm transition-colors">
                   + Legg til deltaker
                 </button>
@@ -861,10 +970,10 @@ export default function LiveDashboard() {
             )}
           </div>
         </div>
-
-        {/* ── Høyre panel: Mobil-logg (skjult på desktop, vises i venstre) ── */}
-        {/* På mobil vises kontroll og logg i en collapsible drawer – utelatt for nå */}
       </div>
+
+      {/* Inaktiv-chip-boks (flytende, nede til høyre) */}
+      {race.is_active && <InactiveChipBox raceId={raceId} onRefresh={load} onLog={addLog} />}
 
       {/* Modaler */}
       {showAdd && <AddModal race={race} onClose={() => setShowAdd(false)} onRefresh={load} onLog={addLog} />}
