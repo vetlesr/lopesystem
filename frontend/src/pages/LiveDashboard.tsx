@@ -1,23 +1,34 @@
 /**
- * LiveDashboard – Side 1 av 3 under et aktivt løp
+ * LiveDashboard – Hoved-operasjonssenter under et aktivt løp
  *
- * Viser:
- * - Nedtelling til neste runde
- * - Hvem som er i mål (active_resting) vs. fortsatt ute (active_running)
- * - Hvem som er ute av løpet (RTC, DNC, osv.)
- * - Rask registrering av runder (tap-to-record)
- * - Navigasjon til de andre sidene
+ * Layout: 3-kolonne på desktop, stacked på mobil
+ *   Venstre:  Countdown + løpskontroll + statistikk
+ *   Midtre:   Deltakertabell (hoveddelen)
+ *   Høyre:    Hendelseslogg + hurtighandlinger
+ *
+ * Funksjoner:
+ * - Live countdown til rundeslutt med fargeskift
+ * - Rask ✓-knapp for å registrere runde (ett klikk)
+ * - Klikk på deltaker → inline detaljer med full rundehistorikk
+ * - Statusendring direkte i tabellen
+ * - Manuell runde med nøyaktig tidspunkt
+ * - Rediger/slett individuelle runder
+ * - Legg til deltaker underveis
+ * - Masse-RTC (alle som ikke er i mål)
+ * - Søk og filter
+ * - Live WebSocket-oppdateringer
+ * - Hendelseslogg (siste handlinger)
  */
 
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import {
   getRace, getParticipants, startRace, nextLoop, finishRace,
-  registerSplit, updateParticipant, addParticipant, removeParticipant,
-  csvPreview, csvImport, exportCsv,
-  fullName, toUtcIso, formatDuration
+  registerSplit, editSplit, deleteSplit, updateParticipant,
+  addParticipant, removeParticipant, massRtc, exportCsv,
+  fullName, toLocalInputValue, toUtcIso, formatDuration
 } from '../api'
-import type { Race, Participant, RunnerStatus } from '../api'
+import type { Race, Participant, Split, RunnerStatus } from '../api'
 
 // ─── Konstanter ───────────────────────────────────────────────────────────────
 
@@ -26,220 +37,417 @@ const STATUS_LABEL: Record<RunnerStatus, string> = {
   active_resting: '✅ I mål',
   rtc: '🛑 RTC',
   dnc: '❌ DNC',
-  over: '⏰ OVER',
+  over: '⏰ Over tid',
   dns: '– DNS',
   dsq: '🚫 DSQ',
-  winner: '🏆 VINNER',
+  winner: '🏆 Vinner',
 }
 
-const STATUS_COLOR: Record<RunnerStatus, string> = {
-  active_running: 'text-emerald-400',
-  active_resting: 'text-blue-400',
-  rtc: 'text-orange-400',
-  dnc: 'text-red-400',
-  over: 'text-yellow-400',
-  dns: 'text-slate-500',
-  dsq: 'text-red-600',
-  winner: 'text-yellow-300',
+const STATUS_SHORT: Record<RunnerStatus, string> = {
+  active_running: '🏃',
+  active_resting: '✅',
+  rtc: '🛑 RTC',
+  dnc: '❌ DNC',
+  over: '⏰',
+  dns: 'DNS',
+  dsq: 'DSQ',
+  winner: '🏆',
 }
 
-const ACTIVE: RunnerStatus[] = ['active_running', 'active_resting']
-const DONE: RunnerStatus[] = ['rtc', 'dnc', 'over', 'dns', 'dsq', 'winner']
-const ALL_STATUSES: RunnerStatus[] = ['active_running', 'active_resting', 'rtc', 'dnc', 'over', 'dns', 'dsq', 'winner']
-
-// ─── Hjelpefunksjoner ─────────────────────────────────────────────────────────
-
-function fmtCd(secs: number) {
-  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60
-  if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
-  return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
+const STATUS_ROW_BG: Record<RunnerStatus, string> = {
+  active_running: 'bg-slate-900 border-slate-800 hover:border-slate-600',
+  active_resting: 'bg-emerald-950/20 border-emerald-900/30 hover:border-emerald-700/50',
+  rtc: 'bg-orange-950/10 border-orange-900/20 opacity-60',
+  dnc: 'bg-red-950/10 border-red-900/20 opacity-60',
+  over: 'bg-yellow-950/10 border-yellow-900/20 opacity-60',
+  dns: 'bg-slate-900/50 border-slate-800/50 opacity-40',
+  dsq: 'bg-red-950/10 border-red-900/20 opacity-50',
+  winner: 'bg-yellow-900/20 border-yellow-700/40',
 }
 
-function fmtTime(utcStr: string): string {
+const ALL_STATUSES: RunnerStatus[] = [
+  'active_running', 'active_resting', 'rtc', 'dnc', 'over', 'dns', 'dsq', 'winner'
+]
+
+function fmtClock(utcStr: string): string {
   const d = new Date(utcStr.endsWith('Z') ? utcStr : utcStr + 'Z')
   return d.toLocaleTimeString('no-NO', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
+// ─── Countdown-hook ────────────────────────────────────────────────────────────
+
 function useCountdown(race: Race | null) {
-  const [remaining, setRemaining] = useState(0)
-  const [elapsed, setElapsed] = useState(0)
+  const [remaining, setRemaining] = useState<number>(0)
+  const [elapsed, setElapsed] = useState<number>(0)
+  const [pct, setPct] = useState<number>(0)
+
   useEffect(() => {
-    if (!race?.is_active || !race.loop_start_utc) return
+    if (!race?.is_active || !race.loop_start_utc) { setRemaining(0); return }
+    const total = race.loop_duration_minutes * 60
+
     const tick = () => {
-      const start = new Date(race.loop_start_utc! + 'Z').getTime()
-      const elapsedMs = Date.now() - start
-      const totalMs = race.loop_duration_minutes * 60 * 1000
-      setElapsed(Math.floor(elapsedMs / 1000))
-      setRemaining(Math.max(0, Math.floor((totalMs - elapsedMs) / 1000)))
+      const start = new Date(race.loop_start_utc!.endsWith('Z') ? race.loop_start_utc! : race.loop_start_utc! + 'Z').getTime()
+      const now = Date.now()
+      const el = Math.floor((now - start) / 1000)
+      const rem = Math.max(0, total - el)
+      setElapsed(el)
+      setRemaining(rem)
+      setPct(Math.min(100, (el / total) * 100))
     }
     tick()
-    const id = setInterval(tick, 500)
+    const id = setInterval(tick, 1000)
     return () => clearInterval(id)
   }, [race?.loop_start_utc, race?.loop_duration_minutes, race?.is_active])
-  return { remaining, elapsed }
+
+  return { remaining, elapsed, pct }
 }
 
-// ─── Status-modal ─────────────────────────────────────────────────────────────
+// ─── Hendelseslogg ────────────────────────────────────────────────────────────
 
-function QuickStatusModal({ race, participant, onClose, onRefresh }: {
-  race: Race; participant: Participant; onClose: () => void; onRefresh: () => void
+interface LogEntry {
+  id: number
+  time: string
+  msg: string
+  type: 'split' | 'status' | 'loop' | 'info'
+}
+
+let logIdCounter = 0
+function makeLog(msg: string, type: LogEntry['type']): LogEntry {
+  return { id: ++logIdCounter, time: new Date().toLocaleTimeString('no-NO', { hour: '2-digit', minute: '2-digit', second: '2-digit' }), msg, type }
+}
+
+// ─── Inline deltakerpanel ─────────────────────────────────────────────────────
+
+function ParticipantPanel({ race, p, onClose, onRefresh, onLog }: {
+  race: Race
+  p: Participant
+  onClose: () => void
+  onRefresh: () => void
+  onLog: (entry: LogEntry) => void
 }) {
-  const [status, setStatus] = useState<RunnerStatus>(participant.status)
+  const [tab, setTab] = useState<'splits' | 'status' | 'info'>('splits')
+  const [editingId, setEditingId] = useState<number | null>(null)
+  const [editVal, setEditVal] = useState('')
+  const [showAddSplit, setShowAddSplit] = useState(false)
+  const [addSplitTime, setAddSplitTime] = useState('')
+  const [selStatus, setSelStatus] = useState<RunnerStatus>(p.status)
+  const [loopsOvr, setLoopsOvr] = useState(p.loops_completed)
+  const [infoEdit, setInfoEdit] = useState(false)
+  const [infoForm, setInfoForm] = useState({
+    first_name: p.first_name, last_name: p.last_name || '',
+    bib_number: p.bib_number.toString(), gender: p.gender || '',
+    age: p.age?.toString() || '', chip_id_1: p.chip_id_1 || '', chip_id_2: p.chip_id_2 || '',
+  })
   const [busy, setBusy] = useState(false)
 
-  const handleSave = async () => {
+  const splits = [...p.splits].sort((a, b) => a.loop_number - b.loop_number)
+  const validDurs = splits.filter(s => s.loop_duration_secs && !s.is_over_time).map(s => s.loop_duration_secs!)
+  const best = validDurs.length ? Math.min(...validDurs) : null
+  const worst = validDurs.length ? Math.max(...validDurs) : null
+  const avg = validDurs.length ? validDurs.reduce((a, b) => a + b, 0) / validDurs.length : null
+
+  const do_ = async (fn: () => Promise<void>, msg: string, logMsg: string, logType: LogEntry['type']) => {
     setBusy(true)
-    try { await updateParticipant(race.id, participant.id, { status }); onRefresh(); onClose() }
+    try { await fn(); onLog(makeLog(logMsg, logType)); onRefresh() }
     finally { setBusy(false) }
   }
 
   return (
-    <div className="fixed inset-0 bg-black/75 flex items-center justify-center z-50 p-4">
-      <div className="bg-slate-800 rounded-2xl p-5 w-full max-w-xs border border-slate-600 shadow-2xl">
-        <div className="flex items-center justify-between mb-4">
+    <div className="bg-slate-950 border border-slate-700 rounded-2xl overflow-hidden">
+      {/* Header */}
+      <div className="bg-slate-900 px-4 py-3 flex items-center justify-between border-b border-slate-800">
+        <div className="flex items-center gap-3">
+          <span className="bg-slate-700 text-white text-xs font-black px-2 py-1 rounded-lg">#{p.bib_number}</span>
           <div>
-            <h3 className="font-bold">{fullName(participant)}</h3>
-            <p className="text-slate-500 text-xs">#{participant.bib_number} · {participant.loops_completed} runder</p>
+            <p className="font-bold text-sm">{fullName(p)}</p>
+            <p className="text-slate-500 text-xs">{p.gender || ''}{p.age ? ` · ${p.age} år` : ''} · {p.total_km.toFixed(1)} km</p>
           </div>
-          <button onClick={onClose} className="text-slate-400 hover:text-white w-8 h-8 flex items-center justify-center rounded-lg hover:bg-slate-700 text-xl">×</button>
         </div>
-        <div className="grid grid-cols-2 gap-2 mb-4">
-          {ALL_STATUSES.map(s => (
-            <button key={s} onClick={() => setStatus(s)}
-              className={`py-2 px-3 rounded-xl text-sm font-medium border transition-colors text-left ${
-                status === s ? 'bg-blue-600 border-blue-500 text-white' : 'bg-slate-700 border-slate-600 text-slate-300 hover:bg-slate-600'
-              }`}>
-              {STATUS_LABEL[s].split(' ').slice(1).join(' ')}
-              {status === s && <span className="float-right text-xs">✓</span>}
-            </button>
-          ))}
-        </div>
-        <div className="flex gap-2">
-          <button onClick={handleSave} disabled={busy}
-            className="flex-1 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white py-2.5 rounded-xl font-semibold text-sm">
-            {busy ? 'Lagrer...' : 'Lagre'}
+        <button onClick={onClose} className="text-slate-500 hover:text-white w-7 h-7 flex items-center justify-center rounded-lg hover:bg-slate-800 transition-colors">✕</button>
+      </div>
+
+      {/* Statistikk */}
+      <div className="grid grid-cols-4 gap-0 border-b border-slate-800">
+        {[
+          [p.loops_completed.toString(), 'Runder', 'text-white'],
+          [best ? formatDuration(best) : '–', 'Beste', 'text-emerald-400'],
+          [avg ? formatDuration(avg) : '–', 'Snitt', 'text-blue-400'],
+          [worst ? formatDuration(worst) : '–', 'Tregeste', 'text-red-400'],
+        ].map(([val, label, color]) => (
+          <div key={label} className="text-center py-2.5 border-r border-slate-800 last:border-0">
+            <p className={`font-black text-base font-mono ${color}`}>{val}</p>
+            <p className="text-slate-600 text-xs">{label}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* Faner */}
+      <div className="flex border-b border-slate-800">
+        {(['splits', 'status', 'info'] as const).map(t => (
+          <button key={t} onClick={() => setTab(t)}
+            className={`flex-1 py-2 text-xs font-semibold uppercase tracking-wider transition-colors ${tab === t ? 'text-white border-b-2 border-blue-500 bg-slate-900/50' : 'text-slate-600 hover:text-slate-400'}`}>
+            {t === 'splits' ? `📊 Runder (${splits.length})` : t === 'status' ? '⚙️ Status' : '👤 Info'}
           </button>
-          <button onClick={onClose} className="flex-1 bg-slate-700 hover:bg-slate-600 text-white py-2.5 rounded-xl text-sm">Avbryt</button>
+        ))}
+      </div>
+
+      {/* Tab: Runder */}
+      {tab === 'splits' && (
+        <div className="p-3 space-y-1.5 max-h-72 overflow-y-auto">
+          {splits.length === 0 ? (
+            <p className="text-center text-slate-600 text-sm py-4">Ingen runder registrert</p>
+          ) : splits.map((s, idx) => {
+            const cumSecs = splits.slice(0, idx + 1).reduce((a, x) => a + (x.loop_duration_secs || 0), 0)
+            const isBest = best !== null && s.loop_duration_secs === best && !s.is_over_time
+            const isWorst = worst !== null && s.loop_duration_secs === worst && !s.is_over_time && validDurs.length > 1
+            const isEditing = editingId === s.id
+            return (
+              <div key={s.id} className={`rounded-xl border p-2.5 ${isBest ? 'bg-emerald-950/30 border-emerald-900/30' : isWorst ? 'bg-red-950/20 border-red-900/20' : s.is_over_time ? 'bg-yellow-950/10 border-yellow-900/20' : 'bg-slate-900 border-slate-800'}`}>
+                {isEditing ? (
+                  <div className="flex items-center gap-2">
+                    <span className="text-slate-500 text-xs w-6">R{s.loop_number}</span>
+                    <input type="datetime-local" step="1" value={editVal} onChange={e => setEditVal(e.target.value)}
+                      className="flex-1 bg-slate-800 border border-slate-600 rounded-lg px-2 py-1 text-white text-xs focus:outline-none focus:border-blue-500" />
+                    <button onClick={() => do_(() => editSplit(race.id, p.id, s.id, toUtcIso(editVal)), '', `✏️ R${s.loop_number} for #${p.bib_number} oppdatert`, 'split')} disabled={busy} className="bg-blue-600 hover:bg-blue-700 text-white px-2 py-1 rounded-lg text-xs">✓</button>
+                    <button onClick={() => setEditingId(null)} className="bg-slate-700 text-white px-2 py-1 rounded-lg text-xs">✕</button>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2 text-xs">
+                    <span className="text-slate-500 w-6 font-bold">R{s.loop_number}</span>
+                    <span className="font-mono text-white w-20">{fmtClock(s.finish_time_utc)}</span>
+                    <span className={`font-mono font-bold w-16 ${isBest ? 'text-emerald-400' : isWorst ? 'text-red-400' : s.is_over_time ? 'text-yellow-400' : 'text-slate-300'}`}>
+                      {s.loop_duration_secs ? formatDuration(s.loop_duration_secs) : '–'}
+                      {isBest && ' ↑'}{isWorst && ' ↓'}
+                    </span>
+                    <span className="text-slate-600 w-16 font-mono">{formatDuration(cumSecs)}</span>
+                    <span className={`text-xs px-1 rounded ${s.recorded_by === 'rfid' ? 'text-purple-400' : 'text-slate-600'}`}>{s.recorded_by === 'rfid' ? '📡' : '✋'}</span>
+                    <div className="flex gap-1 ml-auto">
+                      <button onClick={() => { setEditingId(s.id); setEditVal(toLocalInputValue(s.finish_time_utc)) }} className="text-slate-600 hover:text-blue-400 transition-colors px-1">✏️</button>
+                      <button onClick={() => do_(() => deleteSplit(race.id, p.id, s.id).then(() => {}), '', `🗑️ R${s.loop_number} for #${p.bib_number} slettet`, 'split')} className="text-slate-600 hover:text-red-400 transition-colors px-1">🗑️</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )
+          })}
+
+          {showAddSplit ? (
+            <div className="bg-slate-800 border border-slate-700 rounded-xl p-3 space-y-2">
+              <p className="text-xs text-slate-400 font-semibold">Legg til runde manuelt</p>
+              <input type="datetime-local" step="1" value={addSplitTime} onChange={e => setAddSplitTime(e.target.value)}
+                className="w-full bg-slate-700 border border-slate-600 rounded-lg px-2 py-1.5 text-white text-xs focus:outline-none focus:border-blue-500" />
+              <div className="flex gap-2">
+                <button onClick={() => do_(
+                  () => registerSplit(race.id, p.id, addSplitTime ? toUtcIso(addSplitTime) : undefined).then(() => {}),
+                  '', `➕ Runde lagt til for #${p.bib_number}`, 'split'
+                )} disabled={busy} className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white py-1.5 rounded-lg text-xs font-semibold">
+                  {busy ? '...' : '+ Legg til'}
+                </button>
+                <button onClick={() => { setShowAddSplit(false); setAddSplitTime('') }} className="flex-1 bg-slate-700 text-white py-1.5 rounded-lg text-xs">Avbryt</button>
+              </div>
+            </div>
+          ) : (
+            <button onClick={() => setShowAddSplit(true)} className="w-full bg-slate-900 hover:bg-slate-800 border border-dashed border-slate-700 text-slate-500 hover:text-white py-2 rounded-xl text-xs transition-colors">
+              + Legg til runde manuelt
+            </button>
+          )}
         </div>
+      )}
+
+      {/* Tab: Status */}
+      {tab === 'status' && (
+        <div className="p-3 space-y-3">
+          <div className="grid grid-cols-2 gap-1.5">
+            {ALL_STATUSES.map(s => (
+              <button key={s} onClick={() => setSelStatus(s)}
+                className={`py-2 px-2 rounded-xl text-xs font-medium border text-left transition-colors ${selStatus === s ? 'bg-blue-600 border-blue-500 text-white' : 'bg-slate-900 border-slate-800 text-slate-400 hover:bg-slate-800'}`}>
+                {STATUS_LABEL[s]} {selStatus === s && '✓'}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center gap-3 bg-slate-900 rounded-xl p-2.5 border border-slate-800">
+            <span className="text-slate-500 text-xs">Runder:</span>
+            <button onClick={() => setLoopsOvr(Math.max(0, loopsOvr - 1))} className="w-7 h-7 bg-slate-700 hover:bg-slate-600 rounded-lg text-white font-bold flex items-center justify-center">−</button>
+            <span className="text-white font-black text-lg w-8 text-center">{loopsOvr}</span>
+            <button onClick={() => setLoopsOvr(loopsOvr + 1)} className="w-7 h-7 bg-slate-700 hover:bg-slate-600 rounded-lg text-white font-bold flex items-center justify-center">+</button>
+          </div>
+          <button onClick={() => do_(
+            () => updateParticipant(race.id, p.id, { status: selStatus, loops_completed: loopsOvr }).then(() => {}),
+            '', `⚙️ #${p.bib_number} → ${STATUS_LABEL[selStatus]}`, 'status'
+          )} disabled={busy} className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white py-2.5 rounded-xl text-sm font-bold transition-colors">
+            {busy ? 'Lagrer...' : '✓ Lagre status'}
+          </button>
+        </div>
+      )}
+
+      {/* Tab: Info */}
+      {tab === 'info' && (
+        <div className="p-3">
+          {infoEdit ? (
+            <div className="space-y-2">
+              <div className="grid grid-cols-2 gap-2">
+                {[['Fornavn', 'first_name'], ['Etternavn', 'last_name'], ['Startnr', 'bib_number'], ['Chip 1', 'chip_id_1'], ['Chip 2', 'chip_id_2']].map(([lbl, key]) => (
+                  <div key={key}>
+                    <label className="block text-xs text-slate-500 mb-0.5">{lbl}</label>
+                    <input value={(infoForm as Record<string, string>)[key]} onChange={e => setInfoForm({ ...infoForm, [key]: e.target.value })}
+                      className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2 py-1.5 text-white text-xs focus:outline-none focus:border-blue-500" />
+                  </div>
+                ))}
+                <div>
+                  <label className="block text-xs text-slate-500 mb-0.5">Kjønn</label>
+                  <select value={infoForm.gender} onChange={e => setInfoForm({ ...infoForm, gender: e.target.value })}
+                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2 py-1.5 text-white text-xs focus:outline-none focus:border-blue-500">
+                    <option value="">–</option><option value="M">Mann</option><option value="F">Kvinne</option>
+                  </select>
+                </div>
+              </div>
+              <div className="flex gap-2 pt-1">
+                <button onClick={() => do_(
+                  () => updateParticipant(race.id, p.id, {
+                    first_name: infoForm.first_name, last_name: infoForm.last_name || undefined,
+                    bib_number: parseInt(infoForm.bib_number), gender: infoForm.gender || undefined,
+                    age: infoForm.age ? parseInt(infoForm.age) : undefined,
+                    chip_id_1: infoForm.chip_id_1 || undefined, chip_id_2: infoForm.chip_id_2 || undefined,
+                  }).then(() => { setInfoEdit(false) }),
+                  '', `✏️ Info for #${p.bib_number} oppdatert`, 'info'
+                )} disabled={busy} className="flex-1 bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-xl text-xs font-semibold">
+                  {busy ? '...' : '✓ Lagre'}
+                </button>
+                <button onClick={() => setInfoEdit(false)} className="flex-1 bg-slate-700 text-white py-2 rounded-xl text-xs">Avbryt</button>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-1">
+              {[['Chip ID 1', p.chip_id_1 || '–'], ['Chip ID 2', p.chip_id_2 || '–'], ['Kjønn', p.gender || '–'], ['Alder', p.age ? `${p.age} år` : '–']].map(([lbl, val]) => (
+                <div key={lbl} className="flex justify-between py-1.5 border-b border-slate-800 text-xs">
+                  <span className="text-slate-500">{lbl}</span>
+                  <span className="text-white font-mono">{val}</span>
+                </div>
+              ))}
+              <div className="flex gap-2 pt-2">
+                <button onClick={() => setInfoEdit(true)} className="flex-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white py-2 rounded-xl text-xs transition-colors">✏️ Rediger</button>
+                <button onClick={() => do_(
+                  () => removeParticipant(race.id, p.id).then(() => { onClose() }),
+                  '', `🗑️ #${p.bib_number} fjernet`, 'info'
+                )} className="bg-red-950/30 hover:bg-red-900/40 border border-red-900/30 text-red-400 py-2 px-3 rounded-xl text-xs transition-colors">🗑️</button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Legg til deltaker modal ──────────────────────────────────────────────────
+
+function AddModal({ race, onClose, onRefresh, onLog }: {
+  race: Race, onClose: () => void, onRefresh: () => void, onLog: (e: LogEntry) => void
+}) {
+  const [form, setForm] = useState({ first_name: '', last_name: '', bib_number: '', chip_id_1: '', chip_id_2: '', gender: '', age: '' })
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault(); setBusy(true); setErr('')
+    try {
+      await addParticipant(race.id, {
+        first_name: form.first_name, last_name: form.last_name || undefined,
+        bib_number: parseInt(form.bib_number), chip_id_1: form.chip_id_1 || undefined,
+        chip_id_2: form.chip_id_2 || undefined, gender: form.gender || undefined,
+        age: form.age ? parseInt(form.age) : undefined,
+      })
+      onLog(makeLog(`➕ ${form.first_name} #${form.bib_number} lagt til`, 'info'))
+      onRefresh(); onClose()
+    } catch (e: unknown) {
+      setErr((e as { response?: { data?: { detail?: string } } })?.response?.data?.detail || 'Feil ved lagring')
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+      <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-md shadow-2xl">
+        <div className="flex items-center justify-between p-4 border-b border-slate-800">
+          <h3 className="font-bold text-base">Ny deltaker</h3>
+          <button onClick={onClose} className="text-slate-500 hover:text-white w-8 h-8 flex items-center justify-center rounded-xl hover:bg-slate-800 transition-colors">✕</button>
+        </div>
+        <form onSubmit={handleSubmit} className="p-4 space-y-3">
+          {err && <p className="bg-red-950/30 border border-red-900/30 text-red-400 text-xs px-3 py-2 rounded-xl">{err}</p>}
+          <div className="grid grid-cols-2 gap-3">
+            {[['Fornavn *', 'first_name', true], ['Etternavn', 'last_name', false], ['Startnummer *', 'bib_number', true], ['Chip ID 1', 'chip_id_1', false], ['Chip ID 2', 'chip_id_2', false]].map(([lbl, key, req]) => (
+              <div key={key as string} className={key === 'chip_id_2' ? 'col-span-2' : ''}>
+                <label className="block text-xs text-slate-500 mb-1">{lbl}</label>
+                <input required={req as boolean} value={(form as Record<string, string>)[key as string]}
+                  onChange={e => setForm({ ...form, [key as string]: e.target.value })}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-xl px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500" />
+              </div>
+            ))}
+            <div>
+              <label className="block text-xs text-slate-500 mb-1">Kjønn</label>
+              <select value={form.gender} onChange={e => setForm({ ...form, gender: e.target.value })}
+                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500">
+                <option value="">–</option><option value="M">Mann</option><option value="F">Kvinne</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs text-slate-500 mb-1">Alder</label>
+              <input type="number" value={form.age} onChange={e => setForm({ ...form, age: e.target.value })}
+                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500" />
+            </div>
+          </div>
+          <div className="flex gap-2 pt-1">
+            <button type="submit" disabled={busy} className="flex-1 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white py-2.5 rounded-xl font-bold text-sm transition-colors">
+              {busy ? 'Legger til...' : '+ Legg til'}
+            </button>
+            <button type="button" onClick={onClose} className="flex-1 bg-slate-800 hover:bg-slate-700 text-white py-2.5 rounded-xl text-sm transition-colors">Avbryt</button>
+          </div>
+        </form>
       </div>
     </div>
   )
 }
 
-// ─── Legg til deltaker-modal ──────────────────────────────────────────────────
+// ─── Masse-RTC modal ──────────────────────────────────────────────────────────
 
-function AddParticipantModal({ race, onClose, onRefresh }: {
-  race: Race; onClose: () => void; onRefresh: () => void
+function MassRtcModal({ race, participants, onClose, onRefresh, onLog }: {
+  race: Race, participants: Participant[], onClose: () => void, onRefresh: () => void, onLog: (e: LogEntry) => void
 }) {
-  const [form, setForm] = useState({ first_name: '', last_name: '', bib_number: '', gender: '', age: '', chip_id_1: '', chip_id_2: '' })
+  const stillOut = participants.filter(p => p.status === 'active_running')
   const [busy, setBusy] = useState(false)
-  const [csvMode, setCsvMode] = useState(false)
-  const [csvFile, setCsvFile] = useState<File | null>(null)
-  const [csvHeaders, setCsvHeaders] = useState<string[]>([])
-  const [csvRows, setCsvRows] = useState<Record<string, string>[]>([])
-  const [csvMap, setCsvMap] = useState({ bib_col: 'Bib', first_name_col: 'FirstName', last_name_col: 'LastName', gender_col: '', age_col: '', chip_id_1_col: '' })
-  const [csvResult, setCsvResult] = useState<{ added: number; skipped: number } | null>(null)
 
-  const handleAdd = async (e: React.FormEvent) => {
-    e.preventDefault(); setBusy(true)
+  const handleConfirm = async () => {
+    setBusy(true)
     try {
-      await addParticipant(race.id, {
-        first_name: form.first_name, last_name: form.last_name || undefined,
-        bib_number: parseInt(form.bib_number), gender: form.gender || undefined,
-        age: form.age ? parseInt(form.age) : undefined,
-        chip_id_1: form.chip_id_1 || undefined, chip_id_2: form.chip_id_2 || undefined
-      })
-      onRefresh()
-      setForm({ first_name: '', last_name: '', bib_number: '', gender: '', age: '', chip_id_1: '', chip_id_2: '' })
+      await massRtc(race.id, stillOut.map(p => p.bib_number))
+      onLog(makeLog(`🛑 Masse-RTC: ${stillOut.length} løpere satt til RTC`, 'status'))
+      onRefresh(); onClose()
     } finally { setBusy(false) }
   }
 
-  const handleCsvFile = async (file: File) => {
-    setCsvFile(file)
-    const r = await csvPreview(race.id, file)
-    setCsvHeaders(r.headers); setCsvRows(r.preview)
-    const h = r.headers
-    setCsvMap({ bib_col: h.find(x => /bib/i.test(x)) || h[0] || '', first_name_col: h.find(x => /first|fornavn/i.test(x)) || h[1] || '', last_name_col: h.find(x => /last|etternavn/i.test(x)) || h[2] || '', gender_col: h.find(x => /gender|kjønn/i.test(x)) || '', age_col: h.find(x => /age|alder/i.test(x)) || '', chip_id_1_col: h.find(x => /chip|epc|tag/i.test(x)) || '' })
-  }
-
-  const handleImport = async () => {
-    if (!csvFile) return; setBusy(true)
-    try { const r = await csvImport(race.id, csvFile, csvMap); setCsvResult(r); onRefresh() }
-    finally { setBusy(false) }
-  }
-
   return (
-    <div className="fixed inset-0 bg-black/75 flex items-start justify-center z-50 p-4 overflow-y-auto">
-      <div className="bg-slate-800 rounded-2xl p-5 w-full max-w-lg border border-slate-600 shadow-2xl my-4">
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="font-bold text-lg">Legg til deltakere</h3>
-          <button onClick={onClose} className="text-slate-400 hover:text-white text-2xl leading-none w-8 h-8 flex items-center justify-center rounded-lg hover:bg-slate-700">×</button>
-        </div>
-        <div className="flex gap-2 mb-4">
-          <button onClick={() => setCsvMode(false)} className={`flex-1 py-2 rounded-xl text-sm font-medium transition-colors ${!csvMode ? 'bg-blue-600 text-white' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'}`}>Manuelt</button>
-          <button onClick={() => setCsvMode(true)} className={`flex-1 py-2 rounded-xl text-sm font-medium transition-colors ${csvMode ? 'bg-blue-600 text-white' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'}`}>CSV-import</button>
-        </div>
-        {!csvMode ? (
-          <form onSubmit={handleAdd} className="space-y-3">
-            <div className="grid grid-cols-2 gap-3">
-              {[['Fornavn *', 'first_name', true], ['Etternavn', 'last_name', false], ['Startnummer *', 'bib_number', true], ['Chip ID 1', 'chip_id_1', false], ['Chip ID 2 (backup)', 'chip_id_2', false]].map(([label, key, req]) => (
-                <div key={key as string} className={key === 'chip_id_2' ? 'col-span-2' : ''}>
-                  <label className="block text-xs text-slate-400 mb-1">{label}</label>
-                  <input required={req as boolean} value={(form as Record<string, string>)[key as string]}
-                    onChange={e => setForm({ ...form, [key as string]: e.target.value })}
-                    className="w-full bg-slate-700 border border-slate-600 rounded-xl px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500" />
-                </div>
-              ))}
-              <div>
-                <label className="block text-xs text-slate-400 mb-1">Kjønn</label>
-                <select value={form.gender} onChange={e => setForm({ ...form, gender: e.target.value })} className="w-full bg-slate-700 border border-slate-600 rounded-xl px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500">
-                  <option value="">–</option><option value="M">Mann</option><option value="F">Kvinne</option>
-                </select>
-              </div>
-              <div>
-                <label className="block text-xs text-slate-400 mb-1">Alder</label>
-                <input type="number" value={form.age} onChange={e => setForm({ ...form, age: e.target.value })} className="w-full bg-slate-700 border border-slate-600 rounded-xl px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500" />
-              </div>
-            </div>
-            <button type="submit" disabled={busy} className="w-full bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white py-2.5 rounded-xl font-semibold">{busy ? 'Legger til...' : '+ Legg til deltaker'}</button>
-          </form>
-        ) : csvResult ? (
-          <div className="text-center py-6">
-            <p className="text-3xl mb-2">✅</p>
-            <p className="text-white font-semibold">{csvResult.added} deltakere importert</p>
-            {csvResult.skipped > 0 && <p className="text-slate-400 text-sm">{csvResult.skipped} hoppet over</p>}
-            <button onClick={onClose} className="mt-4 bg-slate-700 hover:bg-slate-600 text-white px-6 py-2 rounded-xl">Lukk</button>
-          </div>
-        ) : !csvFile ? (
-          <label className="block w-full border-2 border-dashed border-slate-600 rounded-xl p-8 text-center cursor-pointer hover:border-slate-500 transition-colors">
-            <p className="text-slate-400">📂 Klikk for å velge CSV-fil</p>
-            <input type="file" accept=".csv" className="hidden" onChange={e => e.target.files?.[0] && handleCsvFile(e.target.files[0])} />
-          </label>
-        ) : (
-          <div className="space-y-3">
-            <p className="text-emerald-400 text-sm">✓ {csvFile.name}</p>
-            {csvRows.length > 0 && (
-              <div className="overflow-x-auto max-h-32 bg-slate-900 rounded-xl border border-slate-700">
-                <table className="text-xs text-slate-300 w-full">
-                  <thead><tr>{csvHeaders.map(h => <th key={h} className="text-left px-2 py-1.5 text-slate-500 border-b border-slate-700">{h}</th>)}</tr></thead>
-                  <tbody>{csvRows.map((row, i) => <tr key={i} className="border-t border-slate-800">{csvHeaders.map(h => <td key={h} className="px-2 py-1">{row[h]}</td>)}</tr>)}</tbody>
-                </table>
-              </div>
-            )}
-            <div className="grid grid-cols-2 gap-2">
-              {[['Startnr', 'bib_col'], ['Fornavn', 'first_name_col'], ['Etternavn', 'last_name_col'], ['Chip ID', 'chip_id_1_col']].map(([label, key]) => (
-                <div key={key}>
-                  <label className="block text-xs text-slate-400 mb-1">{label}</label>
-                  <select value={(csvMap as Record<string, string>)[key]} onChange={e => setCsvMap({ ...csvMap, [key]: e.target.value })} className="w-full bg-slate-700 border border-slate-600 rounded-lg px-2 py-1.5 text-white text-xs">
-                    <option value="">– Ikke bruk –</option>
-                    {csvHeaders.map(h => <option key={h} value={h}>{h}</option>)}
-                  </select>
-                </div>
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+      <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-sm shadow-2xl">
+        <div className="p-5 text-center">
+          <p className="text-3xl mb-3">🛑</p>
+          <h3 className="font-bold text-base mb-2">Masse-RTC</h3>
+          <p className="text-slate-400 text-sm mb-4">
+            Sett alle <strong className="text-white">{stillOut.length} løpere</strong> som fortsatt er ute på løypa til RTC?
+          </p>
+          {stillOut.length > 0 && (
+            <div className="bg-slate-800 rounded-xl p-3 mb-4 text-left max-h-32 overflow-y-auto">
+              {stillOut.map(p => (
+                <p key={p.id} className="text-slate-400 text-xs">#{p.bib_number} {fullName(p)}</p>
               ))}
             </div>
-            <button onClick={handleImport} disabled={busy} className="w-full bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white py-2.5 rounded-xl font-semibold">{busy ? 'Importerer...' : '⬆ Importer'}</button>
+          )}
+          <div className="flex gap-2">
+            <button onClick={handleConfirm} disabled={busy || stillOut.length === 0}
+              className="flex-1 bg-orange-600 hover:bg-orange-700 disabled:opacity-50 text-white py-2.5 rounded-xl font-bold text-sm transition-colors">
+              {busy ? 'Setter...' : `Sett ${stillOut.length} til RTC`}
+            </button>
+            <button onClick={onClose} className="flex-1 bg-slate-800 hover:bg-slate-700 text-white py-2.5 rounded-xl text-sm transition-colors">Avbryt</button>
           </div>
-        )}
+        </div>
       </div>
     </div>
   )
@@ -253,313 +461,414 @@ export default function LiveDashboard() {
   const [race, setRace] = useState<Race | null>(null)
   const [participants, setParticipants] = useState<Participant[]>([])
   const [loading, setLoading] = useState(true)
-  const [statusModal, setStatusModal] = useState<Participant | null>(null)
-  const [showAdd, setShowAdd] = useState(false)
+  const [selectedId, setSelectedId] = useState<number | null>(null)
+  const [search, setSearch] = useState('')
   const [showDone, setShowDone] = useState(false)
-  const [toast, setToast] = useState<{ msg: string; type: 'ok' | 'err' | 'info' } | null>(null)
-  const { remaining, elapsed } = useCountdown(race)
+  const [showAdd, setShowAdd] = useState(false)
+  const [showMassRtc, setShowMassRtc] = useState(false)
+  const [log, setLog] = useState<LogEntry[]>([])
+  const [busyAction, setBusyAction] = useState<string | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
 
-  const showToast = (msg: string, type: 'ok' | 'err' | 'info' = 'ok') => {
-    setToast({ msg, type }); setTimeout(() => setToast(null), 4000)
-  }
+  const addLog = useCallback((entry: LogEntry) => {
+    setLog(prev => [entry, ...prev].slice(0, 50))
+  }, [])
 
   const load = useCallback(async () => {
     try {
-      const [r, ps] = await Promise.all([getRace(raceId), getParticipants(raceId)])
+      const [r, ps] = await Promise.all([
+        getRace(raceId),
+        getParticipants(raceId)
+      ])
       setRace(r); setParticipants(ps)
     } finally { setLoading(false) }
   }, [raceId])
 
   useEffect(() => { load() }, [load])
 
-  // WebSocket med auto-reconnect
-  const wsRef = useRef<WebSocket | null>(null)
+  // WebSocket
   useEffect(() => {
-    let cancelled = false
-    const connect = () => {
-      if (cancelled) return
-      const ws = new WebSocket(`ws://localhost:8000/ws/races/${raceId}`)
-      wsRef.current = ws
-      ws.onmessage = (e) => {
+    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
+    const ws = new WebSocket(`${proto}://${window.location.hostname}:8000/ws/race/${raceId}`)
+    wsRef.current = ws
+    ws.onmessage = (e) => {
+      try {
         const data = JSON.parse(e.data)
-        if (['split_recorded', 'participant_updated', 'new_loop', 'race_started', 'mass_rtc', 'split_edited', 'split_deleted', 'race_finished'].includes(data.event)) load()
-        if (data.event === 'split_recorded') showToast(`✅ ${data.participant_name} – Runde ${data.loop_number}${data.is_over_time ? ' (OVER)' : ''}`)
-        if (data.event === 'potential_winner') showToast(`🏆 Potensiell vinner: ${data.participant_name}!`, 'info')
-        if (data.event === 'new_loop') showToast(`🔔 Runde ${data.loop} startet${data.auto ? ' automatisk' : ''}!`, 'info')
-      }
-      ws.onclose = () => { if (!cancelled) setTimeout(connect, 3000) }
+        if (data.event === 'loop_started') {
+          addLog(makeLog(`🔔 Runde ${data.loop_number} startet!`, 'loop'))
+        } else if (data.event === 'split_registered') {
+          addLog(makeLog(`📡 RFID: Chip registrert`, 'split'))
+        }
+        load()
+      } catch {}
     }
-    connect()
-    return () => { cancelled = true; wsRef.current?.close() }
-  }, [raceId, load])
+    return () => ws.close()
+  }, [raceId, load, addLog])
 
-  const handleStart = async () => {
-    if (!confirm('Start løpet?')) return
-    await startRace(raceId); load()
+  const { remaining, pct } = useCountdown(race)
+
+  const doAction = async (key: string, fn: () => Promise<unknown>, logMsg: string, logType: LogEntry['type']) => {
+    setBusyAction(key)
+    try { await fn(); addLog(makeLog(logMsg, logType)); await load() }
+    finally { setBusyAction(null) }
   }
-  const handleNextLoop = async () => {
-    if (!confirm(`Start runde ${(race?.current_loop ?? 0) + 1} manuelt nå?`)) return
-    await nextLoop(raceId); load()
-  }
-  const handleFinish = async () => {
-    if (!confirm('Avslutt løpet? Dette kan ikke angres.')) return
-    await finishRace(raceId); load()
-  }
+
   const handleFastTap = async (p: Participant) => {
-    try {
-      await registerSplit(raceId, p.id)
-      showToast(`✅ ${fullName(p)} – Runde ${race?.current_loop}`)
-      load()
-    } catch (err: unknown) {
-      showToast(`❌ ${(err as { response?: { data?: { detail?: string } } })?.response?.data?.detail || 'Feil'}`, 'err')
-    }
-  }
-  const handleRemove = async (p: Participant) => {
-    if (!confirm(`Fjern ${fullName(p)} fra løpet?`)) return
-    await removeParticipant(raceId, p.id); load()
+    await doAction(`split-${p.id}`,
+      () => registerSplit(raceId, p.id),
+      `✅ #${p.bib_number} ${p.first_name} – Runde ${p.loops_completed + 1}`,
+      'split'
+    )
   }
 
-  const active = participants.filter(p => ACTIVE.includes(p.status))
-  const inGoal = active.filter(p => p.status === 'active_resting').sort((a, b) => {
-    const aTime = a.splits.find(s => s.loop_number === race?.current_loop)?.finish_time_utc
-    const bTime = b.splits.find(s => s.loop_number === race?.current_loop)?.finish_time_utc
-    if (aTime && bTime) return new Date(aTime).getTime() - new Date(bTime).getTime()
-    return a.bib_number - b.bib_number
-  })
-  const stillRunning = active.filter(p => p.status === 'active_running').sort((a, b) => b.loops_completed - a.loops_completed || a.bib_number - b.bib_number)
-  const done = participants.filter(p => DONE.includes(p.status)).sort((a, b) => b.loops_completed - a.loops_completed || a.bib_number - b.bib_number)
+  // Kategoriser deltakere
+  const active = participants.filter(p => ['active_running', 'active_resting'].includes(p.status))
+  const inGoal = participants.filter(p => p.status === 'active_resting')
+  const stillRunning = participants.filter(p => p.status === 'active_running')
+  const done = participants.filter(p => !['active_running', 'active_resting'].includes(p.status))
 
-  const cdPct = race ? Math.max(0, Math.min(100, (remaining / (race.loop_duration_minutes * 60)) * 100)) : 0
-  const isUrgent = remaining < 120 && remaining > 0 && race?.is_active
+  // Søk
+  const searchFilter = (p: Participant) => {
+    if (!search) return true
+    const q = search.toLowerCase()
+    return fullName(p).toLowerCase().includes(q) || p.bib_number.toString().includes(q)
+  }
+
+  const selectedParticipant = participants.find(p => p.id === selectedId) || null
+
+  // Countdown-farge
+  const countdownColor = remaining > 600 ? 'text-emerald-400' : remaining > 120 ? 'text-yellow-400' : 'text-red-400'
+  const progressColor = pct < 70 ? 'bg-emerald-500' : pct < 90 ? 'bg-yellow-500' : 'bg-red-500'
 
   if (loading) return (
     <div className="flex items-center justify-center h-screen bg-slate-950 text-slate-400">
-      <div className="text-center"><div className="text-4xl mb-3 animate-pulse">⏱</div><p>Laster...</p></div>
+      <div className="text-center"><div className="text-5xl mb-3 animate-pulse">⏱</div><p>Laster...</p></div>
     </div>
   )
   if (!race) return <div className="flex items-center justify-center h-screen bg-slate-950 text-red-400">Løp ikke funnet</div>
 
+  const fmtRemaining = () => {
+    const h = Math.floor(remaining / 3600)
+    const m = Math.floor((remaining % 3600) / 60)
+    const s = remaining % 60
+    if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
+  }
+
   return (
-    <div className="min-h-screen bg-slate-950 text-white">
+    <div className="min-h-screen bg-slate-950 text-white flex flex-col">
 
-      {/* Toast */}
-      {toast && (
-        <div className={`fixed top-4 right-4 z-50 px-5 py-3 rounded-xl shadow-2xl text-sm font-medium border transition-all ${
-          toast.type === 'ok' ? 'bg-emerald-900 border-emerald-700 text-emerald-200' :
-          toast.type === 'err' ? 'bg-red-900 border-red-700 text-red-200' :
-          'bg-blue-900 border-blue-700 text-blue-200'
-        }`}>
-          {toast.msg}
-        </div>
-      )}
-
-      {/* Navigasjonsbar */}
-      <div className="bg-slate-900 border-b border-slate-800 sticky top-0 z-10">
-        <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <Link to="/" className="text-slate-500 hover:text-white text-sm transition-colors">← Hjem</Link>
-            <span className="text-slate-700">|</span>
-            <div>
-              <h1 className="font-bold text-base leading-tight">{race.name}</h1>
-              <p className="text-slate-500 text-xs">{race.location && `${race.location} · `}{race.loop_distance_km} km · {race.loop_duration_minutes} min/runde</p>
+      {/* ── Topbar ──────────────────────────────────────────────────────────── */}
+      <div className="bg-slate-900 border-b border-slate-800 sticky top-0 z-20">
+        <div className="px-4 py-2.5 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3 min-w-0">
+            <Link to="/" className="text-slate-500 hover:text-white text-sm transition-colors shrink-0">← Hjem</Link>
+            <div className="min-w-0">
+              <h1 className="font-black text-base truncate">{race.name}</h1>
+              <p className="text-slate-500 text-xs">{race.location || ''} · {race.loop_distance_km} km/runde</p>
             </div>
           </div>
-          {/* Side-navigasjon */}
-          <nav className="flex items-center gap-1">
+
+          {/* Countdown */}
+          {race.is_active && (
+            <div className="text-center shrink-0">
+              <p className={`font-black text-2xl font-mono leading-none ${countdownColor}`}>{fmtRemaining()}</p>
+              <p className="text-slate-600 text-xs">Runde {race.current_loop}</p>
+            </div>
+          )}
+
+          {/* Nav */}
+          <nav className="flex items-center gap-1 shrink-0">
             <span className="bg-blue-600 text-white text-xs px-3 py-1.5 rounded-lg font-medium">🏃 Live</span>
             <Link to={`/race/${raceId}/edit`} className="text-slate-400 hover:text-white text-xs px-3 py-1.5 bg-slate-800 rounded-lg border border-slate-700 transition-colors">✏️ Rediger</Link>
             <Link to={`/race/${raceId}/loops`} className="text-slate-400 hover:text-white text-xs px-3 py-1.5 bg-slate-800 rounded-lg border border-slate-700 transition-colors">📋 Runder</Link>
             <Link to={`/race/${raceId}/scoreboard`} className="text-slate-400 hover:text-white text-xs px-3 py-1.5 bg-slate-800 rounded-lg border border-slate-700 transition-colors">📺 TV</Link>
-            <a href={exportCsv(raceId)} download className="text-slate-400 hover:text-white text-xs px-3 py-1.5 bg-slate-800 rounded-lg border border-slate-700 transition-colors">⬇ CSV</a>
           </nav>
         </div>
+
+        {/* Progress bar */}
+        {race.is_active && (
+          <div className="h-1 bg-slate-800">
+            <div className={`h-full transition-all duration-1000 ${progressColor}`} style={{ width: `${pct}%` }} />
+          </div>
+        )}
       </div>
 
-      <div className="max-w-6xl mx-auto p-4 space-y-4">
+      {/* ── Hoveddel ────────────────────────────────────────────────────────── */}
+      <div className="flex-1 flex gap-0 overflow-hidden">
 
-        {/* Countdown-panel */}
-        <div className={`rounded-2xl p-5 border ${isUrgent ? 'bg-red-950/40 border-red-800' : 'bg-slate-900 border-slate-800'}`}>
-          <div className="flex flex-wrap items-center gap-6">
+        {/* ── Venstre panel: Kontroll ──────────────────────────────────────── */}
+        <div className="w-56 shrink-0 bg-slate-900 border-r border-slate-800 flex flex-col overflow-y-auto hidden lg:flex">
 
-            {/* Timer */}
-            <div className="flex-1 min-w-48">
-              {race.is_active ? (
-                <>
-                  <p className="text-slate-500 text-xs uppercase tracking-wider mb-1">Runde {race.current_loop} · Tid igjen</p>
-                  <div className="flex items-baseline gap-3 mb-2">
-                    <span className={`text-6xl font-mono font-black tracking-tight ${isUrgent ? 'text-red-400 animate-pulse' : 'text-white'}`}>
-                      {fmtCd(remaining)}
-                    </span>
-                  </div>
-                  <div className="w-full bg-slate-800 rounded-full h-3 overflow-hidden">
-                    <div className={`h-3 rounded-full transition-all duration-1000 ${
-                      isUrgent ? 'bg-red-500' : cdPct > 50 ? 'bg-emerald-500' : 'bg-yellow-500'
-                    }`} style={{ width: `${cdPct}%` }} />
-                  </div>
-                  <p className="text-slate-600 text-xs mt-1">Elapsed: {formatDuration(elapsed)}</p>
-                </>
-              ) : race.is_finished ? (
-                <div>
-                  <p className="text-3xl font-bold text-slate-400">🏁 Løpet er avsluttet</p>
-                  <p className="text-slate-600 text-sm mt-1">{race.current_loop - 1} runder gjennomført</p>
-                </div>
-              ) : (
-                <div>
-                  <p className="text-2xl font-semibold text-slate-400">⏳ Klar til start</p>
-                  <p className="text-slate-600 text-sm mt-1">{participants.length} deltakere registrert</p>
-                </div>
-              )}
-            </div>
+          {/* Løpskontroll */}
+          <div className="p-3 border-b border-slate-800 space-y-2">
+            <p className="text-xs text-slate-600 uppercase tracking-wider">Løpskontroll</p>
 
-            {/* Knapper */}
-            <div className="flex flex-wrap gap-2">
-              {!race.is_active && !race.is_finished && (
-                <button onClick={handleStart} className="bg-emerald-600 hover:bg-emerald-700 text-white px-6 py-3 rounded-xl font-bold transition-colors shadow-lg shadow-emerald-900/30">
-                  ▶ Start løp
-                </button>
-              )}
-              {race.is_active && (
-                <>
-                  <button onClick={handleNextLoop} className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2.5 rounded-xl font-semibold text-sm transition-colors">
-                    ⏭ Neste runde nå
-                  </button>
-                  <button onClick={handleFinish} className="bg-slate-700 hover:bg-red-900 text-white px-4 py-2.5 rounded-xl text-sm transition-colors">
-                    🏁 Avslutt løp
-                  </button>
-                </>
-              )}
-              <button onClick={() => setShowAdd(true)} className="bg-slate-700 hover:bg-slate-600 text-white px-4 py-2.5 rounded-xl text-sm transition-colors">
-                + Deltaker
+            {!race.is_active && !race.is_finished && (
+              <button onClick={() => doAction('start', () => startRace(raceId), '🚀 Løpet startet!', 'loop')}
+                disabled={busyAction === 'start'}
+                className="w-full bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white py-2.5 rounded-xl font-bold text-sm transition-colors">
+                {busyAction === 'start' ? '...' : '🚀 Start løp'}
               </button>
-            </div>
+            )}
 
-            {/* Teller */}
-            <div className="flex gap-6 text-center">
-              <div>
-                <p className="text-4xl font-black text-emerald-400">{inGoal.length}</p>
-                <p className="text-slate-600 text-xs uppercase tracking-wider mt-0.5">I mål</p>
-              </div>
-              <div>
-                <p className="text-4xl font-black text-slate-400">{stillRunning.length}</p>
-                <p className="text-slate-600 text-xs uppercase tracking-wider mt-0.5">Ute</p>
-              </div>
-              <div>
-                <p className="text-4xl font-black text-red-500">{done.length}</p>
-                <p className="text-slate-600 text-xs uppercase tracking-wider mt-0.5">Ferdig</p>
-              </div>
-            </div>
-          </div>
-        </div>
+            {race.is_active && (
+              <>
+                <button onClick={() => doAction('next', () => nextLoop(raceId), `🔔 Runde ${race.current_loop + 1} startet manuelt`, 'loop')}
+                  disabled={busyAction === 'next'}
+                  className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white py-2.5 rounded-xl font-bold text-sm transition-colors">
+                  {busyAction === 'next' ? '...' : `▶ Neste runde`}
+                </button>
+                <button onClick={() => setShowMassRtc(true)}
+                  className="w-full bg-orange-600/20 hover:bg-orange-600/30 border border-orange-700/30 text-orange-300 py-2 rounded-xl text-xs font-medium transition-colors">
+                  🛑 Masse-RTC ({stillRunning.length})
+                </button>
+                <button onClick={() => { if (confirm('Avslutt løpet?')) doAction('finish', () => finishRace(raceId), '🏁 Løpet avsluttet', 'loop') }}
+                  className="w-full bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-400 py-2 rounded-xl text-xs transition-colors">
+                  🏁 Avslutt løp
+                </button>
+              </>
+            )}
 
-        {/* I MÅL – fullførte runden */}
-        {inGoal.length > 0 && (
-          <div>
-            <h2 className="text-xs font-semibold text-blue-400 uppercase tracking-wider mb-2 flex items-center gap-2">
-              <span className="w-2 h-2 bg-blue-400 rounded-full inline-block"></span>
-              I mål – Runde {race.current_loop} ({inGoal.length})
-            </h2>
-            <div className="space-y-1.5">
-              {inGoal.map((p, idx) => {
-                const thisSplit = p.splits.find(s => s.loop_number === race.current_loop)
-                return (
-                  <div key={p.id} className="bg-blue-950/40 border border-blue-800/40 rounded-xl p-3 flex items-center gap-3">
-                    <span className="text-blue-600 text-sm w-6 text-center font-bold">{idx + 1}</span>
-                    <span className="bg-slate-700 text-white text-xs font-bold px-2 py-1 rounded-lg w-10 text-center">#{p.bib_number}</span>
-                    <div className="flex-1 min-w-0">
-                      <span className="font-semibold text-sm">{fullName(p)}</span>
-                      {p.gender && <span className="text-slate-500 text-xs ml-1">({p.gender})</span>}
-                    </div>
-                    <div className="text-right hidden sm:block">
-                      <p className="text-blue-300 text-sm font-mono font-semibold">
-                        {thisSplit ? fmtTime(thisSplit.finish_time_utc) : '–'}
-                      </p>
-                      <p className="text-slate-600 text-xs">
-                        {thisSplit?.loop_duration_secs ? formatDuration(thisSplit.loop_duration_secs) : ''}
-                      </p>
-                    </div>
-                    <span className="text-blue-400 text-xs font-bold w-8 text-center">{p.loops_completed}</span>
-                    <button onClick={() => setStatusModal(p)} className="bg-slate-700 hover:bg-slate-600 text-white text-xs px-2 py-1.5 rounded-lg transition-colors" title="Endre status">⚙️</button>
-                  </div>
-                )
-              })}
-            </div>
-          </div>
-        )}
-
-        {/* UTE PÅ LØYPA – ikke registrert ennå */}
-        {stillRunning.length > 0 && (
-          <div>
-            <h2 className="text-xs font-semibold text-emerald-400 uppercase tracking-wider mb-2 flex items-center gap-2">
-              <span className="w-2 h-2 bg-emerald-500 rounded-full inline-block animate-pulse"></span>
-              Ute på løypa ({stillRunning.length})
-            </h2>
-            <div className="space-y-1.5">
-              {stillRunning.map((p) => (
-                <div key={p.id} className="bg-slate-800/80 border border-slate-700 rounded-xl p-3 flex items-center gap-3">
-                  <span className="bg-slate-700 text-white text-xs font-bold px-2 py-1 rounded-lg w-10 text-center">#{p.bib_number}</span>
-                  <div className="flex-1 min-w-0">
-                    <span className="font-semibold text-sm">{fullName(p)}</span>
-                    {p.gender && <span className="text-slate-500 text-xs ml-1">({p.gender})</span>}
-                  </div>
-                  <span className="text-slate-500 text-xs hidden sm:block">{p.loops_completed} runder</span>
-                  <div className="flex gap-1.5">
-                    {race.is_active && (
-                      <button onClick={() => handleFastTap(p)}
-                        className="bg-emerald-600 hover:bg-emerald-700 text-white text-sm px-4 py-2 rounded-xl font-bold transition-colors">
-                        ✓ I mål
-                      </button>
-                    )}
-                    <button onClick={() => setStatusModal(p)} className="bg-slate-700 hover:bg-slate-600 text-white text-xs px-2 py-2 rounded-lg transition-colors" title="Endre status">⚙️</button>
-                    <button onClick={() => handleRemove(p)} className="text-slate-700 hover:text-red-400 text-xs px-1.5 py-2 rounded-lg transition-colors" title="Fjern">🗑️</button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {active.length === 0 && !race.is_active && !race.is_finished && (
-          <div className="bg-slate-900 rounded-xl border border-slate-800 p-10 text-center text-slate-500">
-            <p className="text-3xl mb-3">👥</p>
-            <p className="font-medium">Ingen deltakere ennå</p>
-            <p className="text-sm mt-1">Legg til deltakere og start løpet</p>
-          </div>
-        )}
-
-        {/* UTGÅTTE LØPERE */}
-        {done.length > 0 && (
-          <div>
-            <button onClick={() => setShowDone(!showDone)}
-              className="flex items-center gap-2 text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2 hover:text-slate-300 transition-colors">
-              <span>{showDone ? '▼' : '▶'}</span>
-              Utgåtte løpere ({done.length})
-            </button>
-            {showDone && (
-              <div className="space-y-1.5">
-                {done.map((p) => (
-                  <div key={p.id} className={`rounded-xl border p-3 flex items-center gap-3 opacity-60 ${
-                    p.status === 'winner' ? 'bg-yellow-900/20 border-yellow-700/30' :
-                    p.status === 'rtc' ? 'bg-orange-950/20 border-orange-900/20' :
-                    'bg-slate-900 border-slate-800'
-                  }`}>
-                    <span className="bg-slate-800 text-slate-400 text-xs font-bold px-2 py-1 rounded-lg w-10 text-center">#{p.bib_number}</span>
-                    <div className="flex-1 min-w-0">
-                      <span className="font-semibold text-sm text-slate-300">{fullName(p)}</span>
-                    </div>
-                    <span className={`text-xs font-medium ${STATUS_COLOR[p.status]}`}>{STATUS_LABEL[p.status]}</span>
-                    <span className="text-slate-500 text-sm font-bold w-8 text-center">{p.loops_completed}</span>
-                    <button onClick={() => setStatusModal(p)} className="bg-slate-800 hover:bg-slate-700 text-white text-xs px-2 py-1.5 rounded-lg transition-colors">⚙️</button>
-                  </div>
-                ))}
+            {race.is_finished && (
+              <div className="bg-slate-800 rounded-xl p-3 text-center">
+                <p className="text-slate-400 text-sm font-semibold">🏁 Løpet er avsluttet</p>
               </div>
             )}
           </div>
-        )}
+
+          {/* Statistikk */}
+          <div className="p-3 border-b border-slate-800 space-y-2">
+            <p className="text-xs text-slate-600 uppercase tracking-wider">Statistikk</p>
+            {[
+              ['Runde', race.current_loop.toString(), 'text-white'],
+              ['Aktive', active.length.toString(), 'text-emerald-400'],
+              ['I mål', inGoal.length.toString(), 'text-blue-400'],
+              ['Ute på løypa', stillRunning.length.toString(), 'text-yellow-400'],
+              ['Utgått', done.length.toString(), 'text-slate-500'],
+              ['Totalt', participants.length.toString(), 'text-slate-400'],
+            ].map(([lbl, val, color]) => (
+              <div key={lbl} className="flex justify-between items-center">
+                <span className="text-slate-600 text-xs">{lbl}</span>
+                <span className={`font-black text-sm ${color}`}>{val}</span>
+              </div>
+            ))}
+          </div>
+
+          {/* Handlinger */}
+          <div className="p-3 space-y-1.5">
+            <p className="text-xs text-slate-600 uppercase tracking-wider mb-2">Handlinger</p>
+            <button onClick={() => setShowAdd(true)} className="w-full bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white py-2 rounded-xl text-xs transition-colors">
+              + Legg til deltaker
+            </button>
+            <a href={exportCsv(raceId)} download className="block w-full bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white py-2 rounded-xl text-xs text-center transition-colors">
+              ⬇ Eksporter CSV
+            </a>
+          </div>
+
+          {/* Hendelseslogg */}
+          <div className="flex-1 p-3 overflow-y-auto">
+            <p className="text-xs text-slate-600 uppercase tracking-wider mb-2">Hendelseslogg</p>
+            {log.length === 0 ? (
+              <p className="text-slate-700 text-xs">Ingen hendelser ennå</p>
+            ) : log.map(entry => (
+              <div key={entry.id} className={`mb-1.5 text-xs rounded-lg px-2 py-1.5 ${
+                entry.type === 'split' ? 'bg-emerald-950/30 text-emerald-300' :
+                entry.type === 'loop' ? 'bg-blue-950/30 text-blue-300' :
+                entry.type === 'status' ? 'bg-orange-950/20 text-orange-300' :
+                'bg-slate-800 text-slate-400'
+              }`}>
+                <span className="text-slate-600 mr-1">{entry.time}</span>{entry.msg}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* ── Midtre panel: Deltakertabell ─────────────────────────────────── */}
+        <div className="flex-1 flex flex-col overflow-hidden">
+
+          {/* Søk + filter */}
+          <div className="bg-slate-900/80 border-b border-slate-800 px-4 py-2.5 flex items-center gap-3">
+            <input value={search} onChange={e => setSearch(e.target.value)}
+              placeholder="🔍 Søk navn eller startnr..."
+              className="flex-1 bg-slate-800 border border-slate-700 rounded-xl px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500 placeholder-slate-600" />
+            <button onClick={() => setShowAdd(true)} className="lg:hidden bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1.5 rounded-xl text-sm font-semibold transition-colors">+ Deltaker</button>
+          </div>
+
+          <div className="flex-1 overflow-y-auto px-4 py-3 space-y-4">
+
+            {/* ── I MÅL ─────────────────────────────────────────────────── */}
+            {inGoal.length > 0 && (
+              <section>
+                <div className="flex items-center gap-2 mb-2">
+                  <div className="w-2 h-2 bg-emerald-500 rounded-full"></div>
+                  <h2 className="text-xs font-bold text-emerald-400 uppercase tracking-wider">I mål ({inGoal.length})</h2>
+                  <div className="flex-1 h-px bg-emerald-900/30"></div>
+                </div>
+                <div className="space-y-1">
+                  {inGoal.filter(searchFilter).map((p, idx) => {
+                    const thisSplit = p.splits.find(s => s.loop_number === race.current_loop)
+                    const isSelected = selectedId === p.id
+                    return (
+                      <div key={p.id}>
+                        <div
+                          onClick={() => setSelectedId(isSelected ? null : p.id)}
+                          className={`rounded-xl border p-3 cursor-pointer transition-all ${isSelected ? 'border-emerald-600/60 bg-emerald-950/20' : STATUS_ROW_BG[p.status]}`}>
+                          <div className="flex items-center gap-3">
+                            {/* Rang */}
+                            <span className="text-emerald-500 font-black text-sm w-6 text-center">{idx + 1}</span>
+                            {/* Bib */}
+                            <span className="bg-slate-700 text-white text-xs font-black px-2 py-1 rounded-lg w-10 text-center">#{p.bib_number}</span>
+                            {/* Navn */}
+                            <div className="flex-1 min-w-0">
+                              <p className="font-semibold text-sm truncate">{fullName(p)}</p>
+                              {thisSplit && (
+                                <p className="text-emerald-400 text-xs font-mono">
+                                  {fmtClock(thisSplit.finish_time_utc)}
+                                  {thisSplit.loop_duration_secs && ` · ${formatDuration(thisSplit.loop_duration_secs)}`}
+                                </p>
+                              )}
+                            </div>
+                            {/* Runder */}
+                            <div className="text-right">
+                              <p className="text-white font-black text-base">{p.loops_completed}</p>
+                              <p className="text-slate-600 text-xs">runder</p>
+                            </div>
+                            {/* Knapper */}
+                            <div className="flex gap-1.5 shrink-0">
+                              <button
+                                onClick={e => { e.stopPropagation(); handleFastTap(p) }}
+                                disabled={busyAction === `split-${p.id}`}
+                                className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs px-3 py-2 rounded-xl font-bold transition-colors">
+                                {busyAction === `split-${p.id}` ? '...' : '✓'}
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                        {isSelected && selectedParticipant && (
+                          <div className="mt-1 ml-3">
+                            <ParticipantPanel race={race} p={selectedParticipant} onClose={() => setSelectedId(null)} onRefresh={load} onLog={addLog} />
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              </section>
+            )}
+
+            {/* ── UTE PÅ LØYPA ──────────────────────────────────────────── */}
+            {stillRunning.length > 0 && (
+              <section>
+                <div className="flex items-center gap-2 mb-2">
+                  <div className="w-2 h-2 bg-yellow-500 rounded-full animate-pulse"></div>
+                  <h2 className="text-xs font-bold text-yellow-400 uppercase tracking-wider">Ute på løypa ({stillRunning.length})</h2>
+                  <div className="flex-1 h-px bg-yellow-900/20"></div>
+                </div>
+                <div className="space-y-1">
+                  {stillRunning.filter(searchFilter).map(p => {
+                    const isSelected = selectedId === p.id
+                    const lastSplit = p.splits.length > 0 ? [...p.splits].sort((a, b) => b.loop_number - a.loop_number)[0] : null
+                    return (
+                      <div key={p.id}>
+                        <div
+                          onClick={() => setSelectedId(isSelected ? null : p.id)}
+                          className={`rounded-xl border p-3 cursor-pointer transition-all ${isSelected ? 'border-blue-600/60 bg-blue-950/10' : STATUS_ROW_BG[p.status]}`}>
+                          <div className="flex items-center gap-3">
+                            <span className="bg-slate-700 text-white text-xs font-black px-2 py-1 rounded-lg w-10 text-center">#{p.bib_number}</span>
+                            <div className="flex-1 min-w-0">
+                              <p className="font-semibold text-sm truncate">{fullName(p)}</p>
+                              {lastSplit ? (
+                                <p className="text-slate-500 text-xs">Sist: R{lastSplit.loop_number} · {fmtClock(lastSplit.finish_time_utc)}</p>
+                              ) : <p className="text-slate-600 text-xs">Ingen runder ennå</p>}
+                            </div>
+                            <div className="text-right">
+                              <p className="text-white font-black text-base">{p.loops_completed}</p>
+                              <p className="text-slate-600 text-xs">runder</p>
+                            </div>
+                            <div className="flex gap-1.5 shrink-0">
+                              <button
+                                onClick={e => { e.stopPropagation(); handleFastTap(p) }}
+                                disabled={busyAction === `split-${p.id}`}
+                                className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs px-3 py-2 rounded-xl font-bold transition-colors">
+                                {busyAction === `split-${p.id}` ? '...' : '✓ I mål'}
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                        {isSelected && selectedParticipant && (
+                          <div className="mt-1 ml-3">
+                            <ParticipantPanel race={race} p={selectedParticipant} onClose={() => setSelectedId(null)} onRefresh={load} onLog={addLog} />
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              </section>
+            )}
+
+            {/* ── UTGÅTTE ───────────────────────────────────────────────── */}
+            {done.length > 0 && (
+              <section>
+                <button onClick={() => setShowDone(!showDone)}
+                  className="flex items-center gap-2 mb-2 w-full text-left hover:text-slate-300 transition-colors">
+                  <span className="text-slate-600 text-xs">{showDone ? '▼' : '▶'}</span>
+                  <h2 className="text-xs font-bold text-slate-600 uppercase tracking-wider">Utgåtte ({done.length})</h2>
+                  <div className="flex-1 h-px bg-slate-800"></div>
+                </button>
+                {showDone && (
+                  <div className="space-y-1">
+                    {done.filter(searchFilter).map(p => {
+                      const isSelected = selectedId === p.id
+                      return (
+                        <div key={p.id}>
+                          <div
+                            onClick={() => setSelectedId(isSelected ? null : p.id)}
+                            className={`rounded-xl border p-3 cursor-pointer transition-all ${isSelected ? 'border-slate-600 bg-slate-800' : STATUS_ROW_BG[p.status]}`}>
+                            <div className="flex items-center gap-3">
+                              <span className="bg-slate-800 text-slate-500 text-xs font-black px-2 py-1 rounded-lg w-10 text-center">#{p.bib_number}</span>
+                              <div className="flex-1 min-w-0">
+                                <p className="font-semibold text-sm text-slate-400 truncate">{fullName(p)}</p>
+                              </div>
+                              <span className="text-xs text-slate-500">{STATUS_SHORT[p.status]}</span>
+                              <span className="text-slate-500 font-bold text-sm">{p.loops_completed}</span>
+                            </div>
+                          </div>
+                          {isSelected && selectedParticipant && (
+                            <div className="mt-1 ml-3">
+                              <ParticipantPanel race={race} p={selectedParticipant} onClose={() => setSelectedId(null)} onRefresh={load} onLog={addLog} />
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+              </section>
+            )}
+
+            {/* Tom tilstand */}
+            {active.length === 0 && done.length === 0 && (
+              <div className="text-center py-20 text-slate-600">
+                <p className="text-5xl mb-4">👥</p>
+                <p className="font-semibold text-base">Ingen deltakere ennå</p>
+                <p className="text-sm mt-1">Legg til deltakere og start løpet</p>
+                <button onClick={() => setShowAdd(true)} className="mt-4 bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-xl font-semibold text-sm transition-colors">
+                  + Legg til deltaker
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* ── Høyre panel: Mobil-logg (skjult på desktop, vises i venstre) ── */}
+        {/* På mobil vises kontroll og logg i en collapsible drawer – utelatt for nå */}
       </div>
 
       {/* Modaler */}
-      {statusModal && <QuickStatusModal race={race} participant={statusModal} onClose={() => setStatusModal(null)} onRefresh={load} />}
-      {showAdd && <AddParticipantModal race={race} onClose={() => setShowAdd(false)} onRefresh={load} />}
+      {showAdd && <AddModal race={race} onClose={() => setShowAdd(false)} onRefresh={load} onLog={addLog} />}
+      {showMassRtc && <MassRtcModal race={race} participants={participants} onClose={() => setShowMassRtc(false)} onRefresh={load} onLog={addLog} />}
     </div>
   )
 }
